@@ -807,6 +807,32 @@ def relaunch_elevated_eco() -> bool:
     return rc > 32
 
 
+class _Tee:
+    """stdout 双写：终端 + 日志文件（提权新窗口跑完即关，输出必须留档）。"""
+
+    def __init__(self, path: str):
+        self._f = open(path, "w", encoding="utf-8", errors="replace")
+        self._out = sys.stdout
+
+    def write(self, s):
+        self._out.write(s)
+        self._f.write(s)
+        return len(s)
+
+    def flush(self):
+        self._out.flush()
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
+
+
+def eco_log_path() -> str:
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, time.strftime("eco_%Y%m%d_%H%M%S.txt"))
+
+
 def proc_name(image: str) -> str:
     return image.rsplit("\\", 1)[-1]
 
@@ -851,6 +877,7 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
         if relaunch_elevated_eco():
             print("已在提权的新窗口继续，本窗口退出。")
+            print(f"完整输出与日志见项目 logs/ 目录（{eco_log_path()[: -21]}…）")
             return 0
         print("提权被取消，退出。")
         return 1
@@ -1050,10 +1077,23 @@ def main() -> int:
         except OSError as e:
             print(f"PDH 计数器打开失败: {e}", file=sys.stderr)
             return 1
+        log_path = eco_log_path()
+        log = _Tee(log_path)
+        sys.stdout = log  # 双写：终端 + 日志
         try:
+            print(f"（本次运行日志: {log_path}）")
             return cmd_eco_on(counters, adapters_meta)
         finally:
             counters.close()
+            sys.stdout = log._out
+            log.close()
+            # 跑完停窗：提权重启的新窗口在进程退出后即关闭，输出会丢；
+            # 管道/重定向（无人值守）不停。
+            if sys.stdin and sys.stdin.isatty():
+                try:
+                    input("\n按回车关闭窗口…")
+                except EOFError:
+                    pass
 
     try:
         counters = GpuCounters()
