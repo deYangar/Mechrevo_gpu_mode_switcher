@@ -932,7 +932,10 @@ def kill_by_name(name: str) -> tuple[bool, str]:
 
 def relaunch_elevated_eco() -> bool:
     """UAC 提权重启 --eco 自身；强杀以管理员运行的占用软件需要管理员。"""
-    params = f'"{os.path.abspath(__file__)}" --eco'
+    if getattr(sys, "frozen", False):
+        params = "--eco"  # PyInstaller exe：重启 exe 自身，不能传 .py 路径
+    else:
+        params = f'"{os.path.abspath(__file__)}" --eco'
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
     return rc > 32
 
@@ -944,16 +947,18 @@ class _Tee:
         # 行缓冲：进程被强杀/崩溃时已打印内容仍在盘上（2026-11-11 实测教训：
         # 块缓冲下被 taskkill，整轮失败诊断 0 字节丢失）
         self._f = open(path, "w", encoding="utf-8", errors="replace", buffering=1)
-        self._out = sys.stdout
+        self._out = sys.stdout  # windowed exe 下为 None：只写文件，不写终端
 
     def write(self, s):
-        self._out.write(s)
+        if self._out is not None:
+            self._out.write(s)
         self._f.write(s)
         self._f.flush()
         return len(s)
 
     def flush(self):
-        self._out.flush()
+        if self._out is not None:
+            self._out.flush()
         self._f.flush()
 
     def close(self):
@@ -961,7 +966,10 @@ class _Tee:
 
 
 def eco_log_path() -> str:
-    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    # onefile 冻结后 __file__ 指向临时解压目录（退出即焚），日志必须落在 exe 旁
+    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                           else os.path.abspath(__file__))
+    d = os.path.join(base, "logs")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, time.strftime("eco_%Y%m%d_%H%M%S.txt"))
 
