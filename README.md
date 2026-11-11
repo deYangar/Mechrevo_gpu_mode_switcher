@@ -21,6 +21,23 @@ python dgpu_detective.py --eco off      # 切回混合模式（发官方同款�
 
 仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll`），无需管理员权限。
 
+## 图形界面（GUI / exe）
+
+源码运行：`python dgpu_gui.py`；构建单文件 exe：
+
+```powershell
+pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefile + uac-admin）
+```
+
+- **exe 双击即请求管理员**（uac-admin 清单）——杀提权占用软件、切换省电都需要；
+  切换编排原样复用命令行 `--eco` 代码，只是跑在内嵌控制台里
+- 持有者表格 = `--report`/`--watch` 常驻版：自动刷新（间隔可调）、新持有黄底高亮、
+  右键菜单（结束进程树 / 结束全部同名 / 复制 PID / 打开文件位置），保护名单标红不杀
+- 底部徽章 = `--status` 三态凭证实时显示（PnP problem / DXGI / GCU 注册表）
+- 「核显省电 / 恢复混合」按钮 = 内嵌控制台运行完整切换编排，问答弹框应答，
+  输出同步留档 `logs/eco_*.txt`；「导出 JSON」= `--json` 同构快照
+- 「驱动层持有者」页 = NVAPI/NVML 模块口径（补 WDDM 盲区，传感器轮询类软件在此现形）
+
 ## 原理
 
 数据来自 **WDDM 图形内核的性能计数器**——任务管理器「性能 → GPU」背后同一套数据，
