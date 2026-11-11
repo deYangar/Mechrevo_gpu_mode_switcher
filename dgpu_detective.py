@@ -762,7 +762,8 @@ def print_gcu_events(events: list[tuple[str, str]]) -> None:
         except ValueError:
             continue
         for key, label in (
-                ("CheckDGpuStatusforIGpuOnlyOnSuccess", "GCU 判据码（1=判「显卡使用中」拒绝）"),
+                ("CheckDGpuStatusforIGpuOnlyOnSuccess",
+                 "GCU 判据码（1=判「显卡使用中」拒绝；2=判据通过）"),
                 ("IGpuOnlyConnectionSwitch_Status", "GCU 核显省电状态"),
                 ("currentSaveingMode", "GCU currentSaveingMode（不可信，仅参考）")):
             if key in data:

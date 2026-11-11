@@ -89,8 +89,8 @@ GCUService 收令后的判据检查、NV 服务联动、EC 写入、超时回滚
 5. **复查（双口径）**：重新采样 + 模块重扫；同名新 pid / 重新加载标
    「被守护/自启拉回」，其余残留如实报告
 6. **发送切换命令**：MQTT 发布官方同款命令并接收 GCU 回报（判据码
-   `CheckDGpuStatusforIGpuOnlyOnSuccess`，1 = GCU 判「显卡使用中」拒绝）；
-   通道不可用（GCUBridge / GCUService 未运行）则如实报错
+   `CheckDGpuStatusforIGpuOnlyOnSuccess`：1 = GCU 判「显卡使用中」拒绝，
+   2 = 判据通过切换执行）；通道不可用（GCUBridge / GCUService 未运行）则如实报错
 7. **凭证验证**：轮询 PnP/DXGI/IGPUonly（上限 3 分钟），EC 级断开即成功；
    超时则如实报告当前状态、查询 GCU 判据码并双口径复查独显持有
    （定位是谁又扑上来挡了判据）
@@ -98,9 +98,16 @@ GCUService 收令后的判据检查、NV 服务联动、EC 写入、超时回滚
 `--eco`（on 方向）开头即提权（UAC 一次）：HwMonitor/GamePP 等硬件监控多以管理员
 运行，不提权 taskkill 直接被拒。清场环节有确认，随时可取消。
 
-已知暂态：`--eco off` 后 1 分钟内立刻 `--eco` 可能被 GCU 判据拒绝——off 刚把 NV
-服务拉起，紧随的 on 撞上服务自停的残留上下文（2026-11-11 实测：15:45 被拒、
-15:48 同环境即成功）。隔 2 分钟再试即过。
+已知暂态（判据码 1 被拒时隔 1-2 分钟重试即可，均实测）：
+- `--eco off` 后 1 分钟内立刻 `--eco`——off 刚把 NV 服务拉起，紧随的 on 撞上
+  服务自停的残留上下文（15:45 被拒、15:48 同环境即成功）
+- 系统重启后 ~20 分钟内的首切可能被拒（NV 生态初始化期，清场干净也拒，
+  16:10 被拒、16:14 补发即过、判据码翻 2）
+
+极端情况兜底：EC 断开⇄恢复连环切换过多后，设备可能卡 problem=43（驱动启动后
+失败，2026-11-11 实测，App 内点击恢复无效）——解法按序：`pnputil /restart-device
+<实例ID>`（提权）→ 仍 DXGI 不可见则 `Start-Service nvlddmkm` + 再 restart-device →
+最后重启机器（POST 全归零，一步到位）。
 
 ### 切回混合模式（--eco off）
 
