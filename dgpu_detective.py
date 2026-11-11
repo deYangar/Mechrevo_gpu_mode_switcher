@@ -770,6 +770,22 @@ def print_gcu_events(events: list[tuple[str, str]]) -> None:
                 print(f"  GCU 回报 {topic}: {key} = {data[key]}（{label}）")
 
 
+def gcu_rejected(events: list[tuple[str, str]]) -> bool:
+    """GCU 判据码是否为 1（判「显卡使用中」拒绝）。
+
+    判据在驱动层，回落比进程退出/WDDM 计数器滞后——2026-11-11 实测：
+    清场复查（+2s）已干净，命令仍被判据码 1 拒绝；隔 ~10s 重发即成功。
+    """
+    for _topic, payload in events:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        if data.get("CheckDGpuStatusforIGpuOnlyOnSuccess") == 1:
+            return True
+    return False
+
+
 def wait_for_mode(target: str, timeout_sec: float = 180.0,
                   interval: float = 2.0) -> DisplayModeState:
     """轮询直到达到目标模式；始终返回最后一次状态（调用方按需判定）。"""
@@ -1054,6 +1070,7 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
     handled_pids: set[int] = set()
     handled_names: set[str] = set()
+    killed = False
     if candidates or drv_holders:
         if candidates:
             print_eco_rows(candidates, f"图形上下文持有（{len(candidates)} 个，按显存排序）")
@@ -1067,6 +1084,7 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
                      "  [2] 不关闭直接继续  [回车/其他] 取消")
         if choice == "1":
+            killed = True
             names = sorted({proc_name(r["image"]) for r in candidates} |
                            {name for _, name, _ in drv_holders})
             print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
@@ -1114,6 +1132,12 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     else:
         print("  ✓ 独显已无任何存活持有（图形上下文 + 驱动层双口径）")
 
+    # ③b 静置：清场后 GCU 的驱动层判据回落比 WDDM 计数器滞后——复查干净≠判据干净
+    #     （2026-11-11 实测：+2s 复查已干净，命令仍被判据码 1 拒绝；隔 ~10s 重发即成功）
+    if killed:
+        print("\n--- 静置 8s（等 GCU 驱动层判据回落）---")
+        time.sleep(8.0)
+
     # ④ 发送官方同款切换命令（控制中心 UI 的同一条 MQTT 通道，GCUService 执行）
     print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
     status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0)
@@ -1123,15 +1147,33 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         return 1
     print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON）")
     print_gcu_events(events)
+    rejected = gcu_rejected(events)
+    if rejected:
+        print("  ! 判据码 1：GCU 判「显卡使用中」拒绝——判据（驱动层）回落比进程退出滞后。")
+        print("    静置 10s 自动重发一次（免手动跑第二次）…")
+        time.sleep(10.0)
+        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0)
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}")
+            return 1
+        print("  ✓ 命令已重发")
+        print_gcu_events(events)
+        rejected = gcu_rejected(events)
 
-    print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
-    res = wait_for_mode("igpu_only", timeout_sec=180.0)
-    if res.mode == "igpu_only":
-        print("\n✓ 核显省电切换成功（官方路径，EC 级断开）：")
+    res = None
+    if rejected:
+        print("\nX 两次命令均被判据码 1 拒绝（判「显卡使用中」），不再空等。当前状态：")
+        res = read_display_mode_state()
         print_mode_state(res)
-        return 0
-    print("\nX 3 分钟内未检测到 EC 级断开，切换未完成。当前状态：")
-    print_mode_state(res)
+    else:
+        print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 100 秒）---")
+        res = wait_for_mode("igpu_only", timeout_sec=100.0)
+        if res.mode == "igpu_only":
+            print("\n✓ 核显省电切换成功（官方路径，EC 级断开）：")
+            print_mode_state(res)
+            return 0
+        print("\nX 100 秒内未检测到 EC 级断开，切换未完成。当前状态：")
+        print_mode_state(res)
     st2, ev2 = gcu_mqtt_command('{"Action": "GETSTATUS"}', listen_secs=4.0)
     if st2 == "ok":
         print_gcu_events(ev2)
@@ -1171,13 +1213,13 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         return 1
     print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_OFF）")
     print_gcu_events(events)
-    print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
-    res = wait_for_mode("hybrid", timeout_sec=180.0)
+    print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 100 秒）---")
+    res = wait_for_mode("hybrid", timeout_sec=100.0)
     if res.mode == "hybrid":
         print("\n✓ 已切回混合模式（独显重新在线）：")
         print_mode_state(res)
         return 0
-    print("\nX 3 分钟内独显未重新上线。当前状态：")
+    print("\nX 100 秒内独显未重新上线。当前状态：")
     print_mode_state(res)
     st2, ev2 = gcu_mqtt_command('{"Action": "GETSTATUS"}', listen_secs=4.0)
     if st2 == "ok":
