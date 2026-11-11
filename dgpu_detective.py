@@ -521,23 +521,24 @@ def ask_yes_no(prompt: str) -> bool:
     return ask(f"{prompt} [y/N]").lower() in ("y", "yes")
 
 
-def graceful_close(pid: int, timeout: float = 3.0) -> bool:
-    """taskkill 不带 /f（对窗口进程等效 WM_CLOSE），轮询等待退出。"""
-    subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.5)
-        alive, _ = classify_pid(pid)
-        if not alive:
-            return True
-    return False
+def kill_by_name(name: str) -> tuple[bool, str]:
+    """taskkill /F /T /IM：按映像名强杀全部同名进程及各自的进程树。
+
+    必须提权调用——否则对以管理员运行的软件（HwMonitor/GamePP 等）直接拒绝访问。
+    """
+    r = subprocess.run(["taskkill", "/F", "/T", "/IM", name],
+                       capture_output=True)
+    msg = (r.stderr or r.stdout or b"").decode("gbk", "replace").strip().replace("\n", " | ")
+    return r.returncode == 0, msg
 
 
-def force_kill(pid: int) -> bool:
-    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-    time.sleep(1.0)
-    alive, _ = classify_pid(pid)
-    return not alive
+def relaunch_elevated_eco(gpu_switch_path: str) -> bool:
+    """UAC 提权重启 --eco 自身；关闭提权软件与 PnP 切换都需要管理员。"""
+    params = f'"{os.path.abspath(__file__)}" --eco'
+    if gpu_switch_path != GPU_SWITCH_DEFAULT:
+        params += f' --gpu-switch "{gpu_switch_path}"'
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    return rc > 32
 
 
 def proc_name(image: str) -> str:
@@ -558,39 +559,22 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
     for r in rows:
         active = active_engines(r)
         eng = " ".join(f"{k} {v:.0f}%" for k, v in active.items()) or "仅上下文"
-        mark = "  ⚠活动中（强杀可能丢未保存数据）" if active else ""
+        note = f"  ← {r['_note']}" if r.get("_note") else ""
         print(f"  pid {r['pid']:<7} {proc_name(r['image']):<{name_w}}"
-              f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{mark}")
-
-
-def close_candidates(candidates: list[dict]) -> None:
-    """优雅关闭候选进程；退不掉的列出，经确认后才强杀。"""
-    print("\n--- 优雅关闭（taskkill，等效点窗口的 X）---")
-    stubborn: list[dict] = []
-    for r in candidates:
-        pid = r["pid"]
-        print(f"  … {proc_name(r['image'])} (pid {pid})", end="", flush=True)
-        if graceful_close(pid):
-            print(" ✓ 已退出")
-        else:
-            print(" ✗ 未退出")
-            stubborn.append(r)
-    if not stubborn:
-        return
-    print_eco_rows(stubborn, f"未能优雅退出（{len(stubborn)} 个）")
-    if ask_yes_no(f"强制结束以上 {len(stubborn)} 个进程？"):
-        for r in stubborn:
-            pid = r["pid"]
-            ok = force_kill(pid)
-            tail = "" if ok else " —— 残留（不阻碍切换，上下文将被强制剥离）"
-            print(f"  {'✓' if ok else '✗'} 强杀 {proc_name(r['image'])} (pid {pid}){tail}")
-    else:
-        print("  跳过强杀（残留不阻碍切换，上下文将被强制剥离）")
+              f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{note}")
 
 
 def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path: str) -> int:
     """核显省电切换编排：检测独显持有 → 提示并关闭 → 复查 → 移交 gpu_switch on。"""
     print("=== 核显省电切换编排（检测 → 清场 → gpu_switch on）===")
+    if not is_admin():
+        print("关闭提权软件（HwMonitor/GamePP 等）与 PnP 切换都需要管理员，提权继续…")
+        if relaunch_elevated_eco(gpu_switch_path):
+            print("已在提权的新窗口继续，本窗口退出。")
+            return 0
+        print("提权被取消，退出。")
+        return 1
+    print("（已提权运行）")
     switch_ready = os.path.isfile(gpu_switch_path)
     if not switch_ready:
         print(f"! 未找到 gpu_switch.py：{gpu_switch_path}")
@@ -615,14 +599,24 @@ def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path
     if stale:
         print(f"（已过滤陈旧计数器实例 {stale} 个：进程已退出）")
 
-    # ② 分类提示 + 选择
+    # ② 分类提示 + 选择；关闭 = 按进程名强杀全部同名实例（含子进程树）
     candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
+    handled_pids: set[int] = set()
+    handled_names: set[str] = set()
     if candidates:
         print_eco_rows(candidates, f"可关闭候选（{len(candidates)} 个，按显存排序）")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或不阻碍禁用）")
-        choice = ask("\n[1] 关闭以上候选并切换  [2] 不关闭直接切换  [回车/其他] 取消")
+        choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并切换"
+                     "  [2] 不关闭直接切换  [回车/其他] 取消")
         if choice == "1":
-            close_candidates(candidates)
+            names = sorted({proc_name(r["image"]) for r in candidates})
+            print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
+            handled_pids = {r["pid"] for r in candidates}
+            handled_names = {proc_name(r["image"]).lower() for r in candidates}
+            for name in names:
+                ok, msg = kill_by_name(name)
+                tail = "" if ok else f" —— {msg[:120]}"
+                print(f"  {'✓' if ok else '✗'} {name}{tail}")
         elif choice != "2":
             print("已取消，未做任何改动。")
             return 1
@@ -630,31 +624,33 @@ def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path
         print("独显当前无用户软件持有 GPU 上下文，无需关闭。")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，不阻碍切换）")
 
-    # ③ 复查：重新采样，如实报告剩余持有
+    # ③ 复查：重新采样；同名新 pid = 被守护/自启拉回
     print("\n--- 复查（重新采样）---")
     time.sleep(2.0)  # 给 WDDM 上下文销毁、计数器实例消失留时间
     remaining = []
     for gpu in sample_once(counters, adapters_meta, include_all=False):
         for r in gpu["processes"]:
             alive, _ = classify_pid(r["pid"])
-            if alive:
-                remaining.append(r)
+            if not alive:
+                continue
+            if r["pid"] in handled_pids:
+                r["_note"] = "杀失败残留"
+            elif proc_name(r["image"]).lower() in handled_names:
+                r["_note"] = "被守护/自启拉回（新 pid），建议软件内退出或禁自启"
+            remaining.append(r)
     if remaining:
         print_eco_rows(remaining, f"剩余持有 {len(remaining)} 个（多为系统组件，不阻碍 PnP 禁用）")
     else:
         print("  ✓ 独显已无任何存活持有进程")
 
-    # ④ 移交 gpu_switch 切换
+    # ④ 移交 gpu_switch 切换（当前已提权，gpu_switch 直接执行不再弹 UAC）
     if not switch_ready:
         print(f"\nX gpu_switch.py 不存在（{gpu_switch_path}），清场完成但切换未执行。")
         return 1
-    if not ask_yes_no("\n开始切换核显省电（gpu_switch on，需管理员/UAC）？"):
-        print("已取消切换（本次已关闭的进程不自动恢复）。")
+    if not ask_yes_no("\n开始切换核显省电（gpu_switch on）？"):
+        print("已取消切换（本次已结束的进程不自动恢复）。")
         return 1
     print(f"\n--- 移交 gpu_switch：{gpu_switch_path} on ---")
-    if not is_admin():
-        print("当前非管理员：gpu_switch 将弹 UAC 在新窗口执行，"
-              "日志见 gpu_mode_switch/evidence/gpu_switch/。")
     return subprocess.run([sys.executable, gpu_switch_path, "on"]).returncode
 
 
