@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import winreg
 from collections import defaultdict
 from dataclasses import dataclass, field
 from ctypes import wintypes
@@ -462,12 +463,203 @@ def watch(counters: GpuCounters, adapters_meta: list[Adapter], interval: float) 
 
 
 # ---------------------------------------------------------------------------
-# 核显省电切换编排（--eco）：检测独显持有 → 提示并关闭 → 移交 gpu_switch on
+# 显示模式状态检测：PnP problem code 主判据 + DXGI 可见性 + GCU 注册表辅证
 # ---------------------------------------------------------------------------
+# 2026-11-11 实测定案：官方「核显省电」成功 = EC 级断开（problem=45，设备从 PCI 层
+# 消失、DXGI 枚举不到）；而 gpu_switch 的 PnP 软禁用 = problem=22，设备仍焊在总线上，
+# 是假切换。三态判据由此而来。
 
-# gpu_switch.py（gpu_mode_switch 项目，官方同款终态序列 CLI）默认位置，--gpu-switch 可覆盖
-GPU_SWITCH_DEFAULT = (r"C:\Users\Yang\.zcode\workspace\default\projects"
-                      r"\gpu_mode_switch\tools\gpu_switch.py")
+IGPUONLY_REG = (r"SOFTWARE\OEM\GamingCenter2\MySetting", "IGPUonly")
+
+# Display 设备类 GUID；本机注册表 serial 键下只有 ClassGUID 没有 Class 值
+DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+# devnode 状态（CM_Locate 双姿势判据，2026-11-11 实测：
+# 幻影设备的 DEVPKEY/CM_Get_DevNode_Status 全部不可读，只有定位成败可判）
+STATE_LABELS = {
+    "online": "在线（problem=0）",
+    "disabled": "软禁用（problem=22，PnP；设备仍在总线上——假切换残留）",
+    "disconnected": "已断开（幻影设备，不在总线上——EC 级下线）",
+    "absent": "实例定位不到（连注册表幻影都不在）",
+}
+
+MODE_LABELS = {
+    "igpu_only": "核显省电（EC 级断开，官方真切换）",
+    "pnp_disabled": "PnP 软禁用（设备仍在总线上——假切换残留）",
+    "hybrid": "混合模式（独显在线）",
+    "unknown": "无法判定",
+}
+
+
+def _devnode_state(instance_id: str) -> str:
+    """cfgmgr32 判定 devnode 状态。
+
+    NORMAL 定位成功 = 设备在场 → CM_Get_DevNode_Status 读 problem
+    （0=online / 22=disabled / 其他原样报）；NORMAL 失败而 PHANTOM 定位成功 =
+    幻影设备（不在总线上）= EC 级下线；两者都失败 = absent。
+    """
+    cfg = ctypes.WinDLL("cfgmgr32")
+    cfg.CM_Locate_DevNodeW.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                       wintypes.LPCWSTR, wintypes.UINT]
+    cfg.CM_Get_DevNode_Status.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                          ctypes.POINTER(wintypes.DWORD),
+                                          wintypes.DWORD, wintypes.UINT]
+    CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM = 0, 1
+    devinst = wintypes.DWORD(0)
+    if cfg.CM_Locate_DevNodeW(ctypes.byref(devinst), instance_id,
+                              CM_LOCATE_DEVNODE_NORMAL) == 0:
+        status = wintypes.DWORD(0)
+        problem = wintypes.DWORD(0)
+        if cfg.CM_Get_DevNode_Status(ctypes.byref(status), ctypes.byref(problem),
+                                     devinst, 0) != 0:
+            return "absent"  # 在场但状态不可读，如实按不可用处理
+        if problem.value == 0:
+            return "online"
+        if problem.value == 22:
+            return "disabled"
+        return f"problem-{problem.value}"
+    if cfg.CM_Locate_DevNodeW(ctypes.byref(devinst), instance_id,
+                              CM_LOCATE_DEVNODE_PHANTOM) == 0:
+        return "disconnected"
+    return "absent"
+
+
+def nvidia_pnp_states() -> list[tuple[str, str]]:
+    """枚举 NVIDIA 显示设备（Class=Display，滤掉 HDAudio 等）的 devnode 状态。
+
+    实例从 Enum/PCI 注册表定位（断开的设备不在设备管理器默认视图里，但注册表仍在）。
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        base = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                              r"SYSTEM\CurrentControlSet\Enum\PCI", 0, winreg.KEY_READ)
+    except OSError:
+        return out
+    with base:
+        i = 0
+        while True:
+            try:
+                dev = winreg.EnumKey(base, i)
+            except OSError:
+                break
+            i += 1
+            if not dev.upper().startswith("VEN_10DE"):
+                continue
+            try:
+                dk = winreg.OpenKey(base, dev)
+            except OSError:
+                continue
+            with dk:
+                j = 0
+                while True:
+                    try:
+                        serial = winreg.EnumKey(dk, j)
+                    except OSError:
+                        break
+                    j += 1
+                    try:
+                        sk = winreg.OpenKey(dk, serial)
+                    except OSError:
+                        continue
+                    with sk:
+                        try:
+                            cls, _ = winreg.QueryValueEx(sk, "ClassGUID")
+                        except OSError:
+                            cls = ""
+                        if str(cls).lower() != DISPLAY_CLASS_GUID:
+                            continue
+                    out.append((f"PCI\\{dev}\\{serial}",
+                                _devnode_state(f"PCI\\{dev}\\{serial}")))
+    return out
+
+
+def _read_igpuonly() -> int | None:
+    """GCU 亲手写的模式意图位（切换成功时 GCU 会更新它）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, IGPUONLY_REG[0], 0,
+                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            v, _ = winreg.QueryValueEx(k, IGPUONLY_REG[1])
+            return int(v)
+    except OSError:
+        return None
+
+
+@dataclass
+class DisplayModeState:
+    problems: list[tuple[str, str]]
+    dxgi_names: list[str]
+    dxgi_error: str = ""
+    igpu_only: int | None = None
+
+    @property
+    def mode(self) -> str:
+        ps = [p for _, p in self.problems]
+        if ps and all(p == "disconnected" for p in ps):
+            return "igpu_only"
+        if ps and all(p == "disabled" for p in ps):
+            return "pnp_disabled"
+        if ps and all(p == "online" for p in ps):
+            return "hybrid"
+        return "unknown"
+
+
+def read_display_mode_state() -> DisplayModeState:
+    dxgi_names: list[str] = []
+    dxgi_error = ""
+    try:
+        dxgi_names = [a.name for a in enumerate_adapters()
+                      if a.vendor_id == VENDOR_NVIDIA and not a.software]
+    except OSError as e:
+        dxgi_error = str(e)
+    return DisplayModeState(problems=nvidia_pnp_states(),
+                            dxgi_names=dxgi_names, dxgi_error=dxgi_error,
+                            igpu_only=_read_igpuonly())
+
+
+def print_mode_state(st: DisplayModeState) -> None:
+    print(f"当前显示模式: {MODE_LABELS[st.mode]}")
+    for inst, p in st.problems:
+        print(f"  PnP  {inst}  →  {STATE_LABELS.get(p, p)}")
+    if st.dxgi_error:
+        print(f"  DXGI 枚举失败: {st.dxgi_error}")
+    elif st.dxgi_names:
+        print(f"  DXGI 可见独显: {'; '.join(st.dxgi_names)}")
+    else:
+        print("  DXGI 枚举不到独显（适配器已从图形栈消失）")
+    if st.igpu_only is not None:
+        intent = "核显省电意图" if st.igpu_only else "混合模式意图"
+        print(f"  GCU 注册表 IGPUonly = {st.igpu_only}（{intent}）")
+
+
+def popup_confirm(text: str, title: str = "dgpu_detective 显示模式切换") -> bool:
+    """置顶选择窗：确定=操作完成，取消=放弃。不依赖终端窗口是否有焦点。"""
+    MB_OKCANCEL, MB_ICONINFORMATION = 0x1, 0x40
+    MB_TOPMOST, MB_SETFOREGROUND = 0x40000, 0x10000
+    r = ctypes.windll.user32.MessageBoxW(
+        None, text, title,
+        MB_OKCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND)
+    return r == 1  # IDOK
+
+
+def wait_for_mode(target: str, timeout_sec: float = 180.0,
+                  interval: float = 2.0) -> DisplayModeState:
+    """轮询直到达到目标模式；始终返回最后一次状态（调用方按需判定）。"""
+    start = time.monotonic()
+    deadline = start + timeout_sec
+    st = read_display_mode_state()
+    while st.mode != target and time.monotonic() < deadline:
+        elapsed = int(time.monotonic() - start)
+        ps = [p for _, p in st.problems]
+        cur = STATE_LABELS.get(ps[0], ps[0]) if ps else "不可读"
+        print(f"  … 等待切换生效（已等 {elapsed}s，当前 PnP: {cur}）")
+        time.sleep(interval)
+        st = read_display_mode_state()
+    return st
+
+
+# ---------------------------------------------------------------------------
+# 核显省电切换编排（--eco）：检测独显持有 → 清场 → 弹窗引导官方切换 → 凭证验证
+# ---------------------------------------------------------------------------
 
 # 系统/服务组件：杀了会被系统拉回或影响桌面（输入/开始菜单/窗口管理），且 gpu_mode_switch
 # 的 E7 实测「独显上下文进程不阻碍 PnP 禁用」——只列出说明，不自动关闭
@@ -517,10 +709,6 @@ def ask(prompt: str, default: str = "") -> str:
         return default
 
 
-def ask_yes_no(prompt: str) -> bool:
-    return ask(f"{prompt} [y/N]").lower() in ("y", "yes")
-
-
 def kill_by_name(name: str) -> tuple[bool, str]:
     """taskkill /F /T /IM：按映像名强杀全部同名进程及各自的进程树。
 
@@ -532,11 +720,9 @@ def kill_by_name(name: str) -> tuple[bool, str]:
     return r.returncode == 0, msg
 
 
-def relaunch_elevated_eco(gpu_switch_path: str) -> bool:
-    """UAC 提权重启 --eco 自身；关闭提权软件与 PnP 切换都需要管理员。"""
+def relaunch_elevated_eco() -> bool:
+    """UAC 提权重启 --eco 自身；强杀以管理员运行的占用软件需要管理员。"""
     params = f'"{os.path.abspath(__file__)}" --eco'
-    if gpu_switch_path != GPU_SWITCH_DEFAULT:
-        params += f' --gpu-switch "{gpu_switch_path}"'
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
     return rc > 32
 
@@ -564,21 +750,31 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
               f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{note}")
 
 
-def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path: str) -> int:
-    """核显省电切换编排：检测独显持有 → 提示并关闭 → 复查 → 移交 gpu_switch on。"""
-    print("=== 核显省电切换编排（检测 → 清场 → gpu_switch on）===")
+def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
+    """切核显省电（真切换）：检测独显持有 → 清场 → 弹窗引导官方控制台操作 → 凭证验证。"""
+    st = read_display_mode_state()
+    print("=== 核显省电切换编排（检测 → 清场 → 官方切换 → 凭证验证）===")
+    print_mode_state(st)
+    if st.mode == "igpu_only":
+        print("\n已在核显省电态（PnP 已断开 + DXGI 不可见），无需切换。")
+        return 0
+    if st.mode == "pnp_disabled":
+        print("\n检测到 PnP 软禁用残留（假切换形态）：设备仍焊在总线上。")
+        print("请先在设备管理器启用 NVIDIA 设备（或 gpu_mode_switch 项目 gpu_switch.py off）")
+        print("恢复混合模式后，再用本命令走官方真切换。")
+        return 1
+    if st.mode == "unknown":
+        print("\n无法判定当前显示模式（PnP/DXGI 凭证异常，如上），不继续。")
+        return 1
+
     if not is_admin():
-        print("关闭提权软件（HwMonitor/GamePP 等）与 PnP 切换都需要管理员，提权继续…")
-        if relaunch_elevated_eco(gpu_switch_path):
+        print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
+        if relaunch_elevated_eco():
             print("已在提权的新窗口继续，本窗口退出。")
             return 0
         print("提权被取消，退出。")
         return 1
     print("（已提权运行）")
-    switch_ready = os.path.isfile(gpu_switch_path)
-    if not switch_ready:
-        print(f"! 未找到 gpu_switch.py：{gpu_switch_path}")
-        print("  检测/关闭环节照常可用；切换环节无法执行（--gpu-switch 可指定路径）")
 
     # ① 抓独显持有清单，按可关闭/系统组件分类（过滤已退出的陈旧实例）
     time.sleep(0.5)  # 引擎利用率是 rate 计数器，需要真实间隔才有读数
@@ -605,9 +801,9 @@ def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path
     handled_names: set[str] = set()
     if candidates:
         print_eco_rows(candidates, f"可关闭候选（{len(candidates)} 个，按显存排序）")
-        print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或不阻碍禁用）")
-        choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并切换"
-                     "  [2] 不关闭直接切换  [回车/其他] 取消")
+        print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或系统组件）")
+        choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
+                     "  [2] 不关闭直接继续  [回车/其他] 取消")
         if choice == "1":
             names = sorted({proc_name(r["image"]) for r in candidates})
             print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
@@ -639,19 +835,70 @@ def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path
                 r["_note"] = "被守护/自启拉回（新 pid），建议软件内退出或禁自启"
             remaining.append(r)
     if remaining:
-        print_eco_rows(remaining, f"剩余持有 {len(remaining)} 个（多为系统组件，不阻碍 PnP 禁用）")
+        print_eco_rows(remaining, f"剩余持有 {len(remaining)} 个（系统组件不阻碍切换；"
+                                  "若下面切换失败，优先怀疑其余用户软件又扑上来挡判据）")
     else:
         print("  ✓ 独显已无任何存活持有进程")
 
-    # ④ 移交 gpu_switch 切换（当前已提权，gpu_switch 直接执行不再弹 UAC）
-    if not switch_ready:
-        print(f"\nX gpu_switch.py 不存在（{gpu_switch_path}），清场完成但切换未执行。")
-        return 1
-    if not ask_yes_no("\n开始切换核显省电（gpu_switch on）？"):
+    # ④ 弹窗引导官方切换：占用杀绝后 GCU 判据可通过，控制台点击即真切换
+    if not popup_confirm(
+            "独显占用清场完成。\n\n"
+            "请打开「机械革命控制中心」→ 显卡设置，开启「核显省电模式」。\n"
+            "等控制台切换动作完成（不再转圈）后，点【确定】验证结果；\n"
+            "点【取消】放弃本次切换（已结束的进程不会自动恢复）。",
+            "请到控制中心开启核显省电"):
         print("已取消切换（本次已结束的进程不自动恢复）。")
         return 1
-    print(f"\n--- 移交 gpu_switch：{gpu_switch_path} on ---")
-    return subprocess.run([sys.executable, gpu_switch_path, "on"]).returncode
+
+    print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
+    res = wait_for_mode("igpu_only", timeout_sec=180.0)
+    if res.mode == "igpu_only":
+        print("\n✓ 核显省电切换成功（官方路径，EC 级断开）：")
+        print_mode_state(res)
+        return 0
+    print("\nX 3 分钟内未检测到 EC 级断开，切换未完成。当前状态：")
+    print_mode_state(res)
+    print("\n常见原因：清场后有软件重新拉起独显上下文，GCU 判据仍判「显卡使用中」。")
+    print("复查当前独显持有：")
+    time.sleep(0.5)
+    print_eco_rows([r for gpu in sample_once(counters, adapters_meta, include_all=False)
+                    for r in gpu["processes"] if classify_pid(r["pid"])[0]],
+                   "当前持有（全部）")
+    print("可处理后再到控制台重试；或用 --status 随时查看当前模式。")
+    return 1
+
+
+def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
+    """切回混合模式：确认省电态 → 弹窗引导官方控制台操作 → 凭证验证。
+
+    不杀进程、不动 PnP，无需提权。
+    """
+    st = read_display_mode_state()
+    print("=== 显示模式切换：核显省电 → 混合模式 ===")
+    print_mode_state(st)
+    if st.mode == "hybrid":
+        print("\n已在混合模式（独显在线），无需切换。")
+        return 0
+    if st.mode != "igpu_only":
+        print(f"\n当前模式不是核显省电态（{MODE_LABELS[st.mode]}），本命令只负责省电态 → 混合。")
+        return 1
+    if not popup_confirm(
+            "请打开「机械革命控制中心」→ 显卡设置，切回「混合模式」。\n\n"
+            "等控制台切换动作完成（不再转圈）后，点【确定】验证独显已重新上线；\n"
+            "点【取消】放弃。",
+            "请到控制中心切回混合模式"):
+        print("已取消，未做任何改动。")
+        return 1
+    print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
+    res = wait_for_mode("hybrid", timeout_sec=180.0)
+    if res.mode == "hybrid":
+        print("\n✓ 已切回混合模式（独显重新在线）：")
+        print_mode_state(res)
+        return 0
+    print("\nX 3 分钟内独显未重新上线。当前状态：")
+    print_mode_state(res)
+    print("可稍后重试，或用 --status 随时查看当前模式。")
+    return 1
 
 
 def main() -> int:
@@ -661,10 +908,12 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="非独显适配器（核显等）也一并报告")
     ap.add_argument("--json", action="store_true", help="JSON 输出（一次性快照）")
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
-    ap.add_argument("--eco", action="store_true",
-                    help="核显省电切换编排：列出独显占用软件并关闭后，调 gpu_switch 切换")
-    ap.add_argument("--gpu-switch", default=GPU_SWITCH_DEFAULT, metavar="PATH",
-                    help="--eco 调用的 gpu_switch.py 路径（默认指向 gpu_mode_switch 项目）")
+    ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off"],
+                    metavar="{on,off}",
+                    help="显示模式切换编排：on = 检测独显占用并清场后，弹窗引导到官方控制中心"
+                         "开启核显省电并自动验证（默认）；off = 弹窗引导切回混合模式并验证")
+    ap.add_argument("--status", action="store_true",
+                    help="报告当前显示模式与凭证（PnP problem code / DXGI / GCU 注册表）")
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")
     args = ap.parse_args()
 
@@ -678,6 +927,24 @@ def main() -> int:
         print_list_gpus(adapters_meta)
         return 0
 
+    if args.status:
+        print_mode_state(read_display_mode_state())
+        return 0
+
+    if args.eco == "off":
+        return cmd_eco_off(adapters_meta)
+
+    if args.eco == "on":
+        try:
+            counters = GpuCounters()
+        except OSError as e:
+            print(f"PDH 计数器打开失败: {e}", file=sys.stderr)
+            return 1
+        try:
+            return cmd_eco_on(counters, adapters_meta)
+        finally:
+            counters.close()
+
     try:
         counters = GpuCounters()
     except OSError as e:
@@ -685,8 +952,6 @@ def main() -> int:
         return 1
 
     try:
-        if args.eco:
-            return cmd_eco(counters, adapters_meta, args.gpu_switch)
         if args.watch:
             watch(counters, adapters_meta, args.interval)
             return 0

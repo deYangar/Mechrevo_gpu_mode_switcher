@@ -14,8 +14,9 @@ python dgpu_detective.py --all          # 核显等非独显适配器也一并�
 python dgpu_detective.py --watch        # 持续监视独显，新持有进程冒头即时报告
 python dgpu_detective.py --watch --interval 2
 python dgpu_detective.py --json         # 一次性 JSON 快照
-python dgpu_detective.py --eco          # 核显省电一键切换：列出占用→确认关闭→移交 gpu_switch
-python dgpu_detective.py --eco --gpu-switch <路径>   # 指定 gpu_switch.py 位置
+python dgpu_detective.py --status       # 当前显示模式与凭证（PnP / DXGI / GCU 注册表）
+python dgpu_detective.py --eco          # 核显省电一键切换（检测→清场→引导官方切换→验证）
+python dgpu_detective.py --eco off      # 切回混合模式（引导官方切换→验证）
 ```
 
 仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll`），无需管理员权限。
@@ -49,23 +50,47 @@ D3D / Vulkan / OpenGL / CUDA 全都过这一层（GeForce WDDM 模式下 nvidia-
 - `<拒绝访问 pid=N>` = 受保护进程（驱动/反作弊等），普通权限查不到名字
 - pid 4 = System 内核进程
 
-## 核显省电一键切换（--eco）
+## 显示模式状态与切换
 
-配合 `gpu_mode_switch` 项目的 `gpu_switch.py`（官方同款终态序列 CLI）使用，把
-「找出占用 → 关软件 → 切换」串成一条命令：
+### 三态判据（--status）
 
-1. **检测**：WDDM 口径抓独显全部持有进程（比 nvidia-smi 全，含 0 显存纯上下文
+2026-11-11 实测定案：机械革命官方「核显省电」成功 = **EC 级断开**——独显设备
+从 PCI 总线消失（devnode 成幻影、DXGI 枚举不到）。判据走 cfgmgr32 双姿势定位：
+
+| PnP 状态 | 含义 | 判定 |
+|---|---|---|
+| 在线（problem=0） | 设备在场正常工作 | 混合模式 |
+| 软禁用（problem=22） | PnP 软件禁用，设备仍焊在总线上 | 假切换残留 |
+| 已断开（幻影） | NORMAL 定位失败、PHANTOM 定位成功 | 核显省电（真切换） |
+
+辅证：DXGI 独显可见性 + GCU 注册表 `IGPUonly`（切换成功时由 GCU 亲手更新）。
+
+### 核显省电切换（--eco）
+
+把「找出占用 → 清场 → 官方切换 → 验证」串成一条命令。**真切换由机械革命控制
+中心的官方路径完成**（占用杀绝后 GCU 判据即可通过，控制台点击即 EC 级下线），
+本工具负责清场与前后验证，不再走 PnP 软禁用（那是假切换）：
+
+1. **前置状态检测**：已在省电态 → 直接退出；检测到 PnP 软禁用残留 → 提示先恢复
+2. **检测**：WDDM 口径抓独显全部持有进程（比 nvidia-smi 全，含 0 显存纯上下文
    持有者），自动过滤已退出的陈旧计数器实例
-2. **分类提示**：用户软件列为「可关闭候选」；系统/服务组件（dwm / explorer /
-   nvcontainer 等）只列出不动——杀了会被系统拉回，且实测不阻碍 PnP 禁用
-3. **关闭**：确认后按进程名 `taskkill /F /T /IM` 强杀——**全部同名实例与各自的
+3. **分类提示**：用户软件列为「可关闭候选」；系统/服务组件（dwm / explorer /
+   nvcontainer 等）只列出不动——杀了会被系统拉回，且实测不阻碍官方切换
+4. **关闭**：确认后按进程名 `taskkill /F /T /IM` 强杀——**全部同名实例与各自的
    进程树一起结束**（覆盖同名子进程场景）；taskkill 结果如实显示
-4. **复查**：重新采样；同名新 pid 标「被守护/自启拉回」，其余残留如实报告
-5. **切换**：确认后调 `gpu_switch.py on`，完成 PnP 禁用 + json/注册表/GCU 状态同步
+5. **复查**：重新采样；同名新 pid 标「被守护/自启拉回」，其余残留如实报告
+6. **弹窗引导官方切换**：弹置顶选择窗，到「机械革命控制中心」开「核显省电模式」，
+   操作完成后点【确定】
+7. **凭证验证**：轮询 PnP/DXGI/IGPUonly（上限 3 分钟），EC 级断开即成功；
+   超时则如实报告当前状态并复查独显持有（定位是谁又扑上来挡了判据）
 
-`--eco` 开头即提权（UAC 一次）：HwMonitor/GamePP 等硬件监控多以管理员运行，
-不提权 taskkill 直接被拒；提权后 gpu_switch 也直接执行，不再二次弹窗。
-每一步都有确认环节，随时可取消。
+`--eco`（on 方向）开头即提权（UAC 一次）：HwMonitor/GamePP 等硬件监控多以管理员
+运行，不提权 taskkill 直接被拒。每一步都有确认环节，随时可取消。
+
+### 切回混合模式（--eco off）
+
+当前在省电态时可用：弹窗引导到控制中心切回「混合模式」，轮询验证独显重新在线
+（PnP 在线 + DXGI 重现）。不杀进程、不动 PnP，无需提权。
 
 ## 独显关不掉的排查思路
 
