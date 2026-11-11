@@ -73,6 +73,17 @@ MODE_COLORS = {  # 徽章配色：fg, bg
 }
 
 
+@contextlib.contextmanager
+def _redirect_stdin(new):
+    """标准库没有 redirect_stdin（只有 stdout/stderr），自己补一个。"""
+    old = sys.stdin
+    sys.stdin = new
+    try:
+        yield
+    finally:
+        sys.stdin = old
+
+
 class _AskBridge:
     """eco worker 的假 stdin：input() 读一行 = 主线程弹问答框，应答回传。"""
 
@@ -608,7 +619,7 @@ class App:
         rc = -1
         try:
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink), \
-                    contextlib.redirect_stdin(self.ask_bridge):
+                    _redirect_stdin(self.ask_bridge):
                 if target == "on":
                     counters = eng.GpuCounters()  # 切换 worker 独立计数器，用完即关
                     try:
