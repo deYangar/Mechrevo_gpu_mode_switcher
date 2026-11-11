@@ -22,6 +22,8 @@ import ctypes
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -633,14 +635,138 @@ def print_mode_state(st: DisplayModeState) -> None:
         print(f"  GCU 注册表 IGPUonly = {st.igpu_only}（{intent}）")
 
 
-def popup_confirm(text: str, title: str = "dgpu_detective 显示模式切换") -> bool:
-    """置顶选择窗：确定=操作完成，取消=放弃。不依赖终端窗口是否有焦点。"""
-    MB_OKCANCEL, MB_ICONINFORMATION = 0x1, 0x40
-    MB_TOPMOST, MB_SETFOREGROUND = 0x40000, 0x10000
-    r = ctypes.windll.user32.MessageBoxW(
-        None, text, title,
-        MB_OKCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND)
-    return r == 1  # IDOK
+# === GCU 控制通道段（MQTT，与官方控制中心同路线）===
+# 控制中心架构：UI（CCUWinUI）→ GCUBridge（127.0.0.1:13688，MQTT 3.1.1 broker）
+#   → GCUService 执行（判据检查 / NV 服务联动 / EC 写入 / 超时回滚全套官方逻辑）。
+# 本段向 Setting/Control 发布与控制中心点击完全相同的命令 = 同路线程序化触发。
+# 凭据与 clientId 白名单来自 L-Mechrevo 反编译源码 + 2026-11-11 实测
+# （UWPClient_3 已被 broker 拒绝，UWPClient_4 可用；同 id 互踢，占用窗口仅数秒）。
+GCU_MQTT_HOST, GCU_MQTT_PORT = "127.0.0.1", 13688
+GCU_MQTT_USER = "UWPClient_User_4"
+GCU_MQTT_PASS = "UWPClient_Pwd888881772688_4"
+GCU_MQTT_CLIENT_ID = "UWPClient_4"
+GCU_ECO_ON_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_ON", "SetToWMIEC": "OK"}'
+GCU_ECO_OFF_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_OFF", "SetToWMIEC": "OK"}'
+
+
+def _mqtt_enc_len(n: int) -> bytes:
+    """MQTT Remaining Length 变长编码。"""
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+
+def _mqtt_str(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return struct.pack(">H", len(b)) + b
+
+
+def _mqtt_packet(body: bytes, ptype: int, flags: int = 0) -> bytes:
+    return bytes([(ptype << 4) | flags]) + _mqtt_enc_len(len(body)) + body
+
+
+def _mqtt_read_packet(sock) -> tuple[int, int, bytes] | None:
+    """读一个完整 MQTT 包 → (type, flags, body)；连接关闭返回 None。"""
+    head = sock.recv(1)
+    if not head:
+        return None
+    ptype, flags = head[0] >> 4, head[0] & 0xF
+    mult, length = 1, 0
+    while True:
+        b = sock.recv(1)
+        if not b:
+            raise ConnectionError("broker 在长度字段中断开")
+        length += (b[0] & 0x7F) * mult
+        mult *= 128
+        if not b[0] & 0x80:
+            break
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            raise ConnectionError("broker 在包体中断开")
+        body += chunk
+    return ptype, flags, body
+
+
+def _mqtt_parse_publish(flags: int, body: bytes) -> tuple[str, str]:
+    """解析 QoS0 PUBLISH → (topic, payload)。"""
+    tlen = struct.unpack(">H", body[:2])[0]
+    topic = body[2:2 + tlen].decode("utf-8", "replace")
+    pos = 2 + tlen
+    if flags & 0x6:  # QoS1/2 有包标识
+        pos += 2
+    return topic, body[pos:].decode("utf-8", "replace")
+
+
+def gcu_mqtt_command(payload: str, listen_secs: float = 8.0
+                     ) -> tuple[str, list[tuple[str, str]]]:
+    """连 GCU 控制通道：订阅状态回报 → 发布命令到 Setting/Control → 收 listen_secs 秒。
+
+    返回 (状态, [(topic, payload), ...])。状态 "ok" 或错误描述。
+    仅依赖标准库 socket/struct 手写 MQTT 3.1.1 最小客户端。
+    """
+    events: list[tuple[str, str]] = []
+    try:
+        sock = socket.create_connection((GCU_MQTT_HOST, GCU_MQTT_PORT), timeout=5)
+    except OSError as e:
+        return f"无法连接 {GCU_MQTT_HOST}:{GCU_MQTT_PORT}（{e}）", events
+    try:
+        sock.settimeout(1.0)
+        sock.sendall(_mqtt_packet(
+            _mqtt_str("MQTT") + bytes([4, 0xC2]) + struct.pack(">H", 30) +
+            _mqtt_str(GCU_MQTT_CLIENT_ID) + _mqtt_str(GCU_MQTT_USER) +
+            _mqtt_str(GCU_MQTT_PASS), 1))
+        while True:
+            p = _mqtt_read_packet(sock)
+            if p is None:
+                return "broker 在等待 CONNACK 时断开", events
+            ptype, _, body = p
+            if ptype == 2:  # CONNACK
+                rc = body[1] if len(body) > 1 else -1
+                if rc != 0:
+                    return f"broker 拒绝连接（rc={rc}，2=clientId 被拒）", events
+                break
+        for i, t in enumerate(("Setting/Status", "GPUDevice/Status"), start=1):
+            sock.sendall(_mqtt_packet(
+                struct.pack(">H", i) + _mqtt_str(t) + bytes([0]), 8, flags=2))
+        sock.sendall(_mqtt_packet(
+            _mqtt_str("Setting/Control") + payload.encode("utf-8"), 3))
+        deadline = time.monotonic() + listen_secs
+        while time.monotonic() < deadline:
+            try:
+                p = _mqtt_read_packet(sock)
+            except socket.timeout:
+                continue
+            if p is None:
+                break
+            ptype, flags, body = p
+            if ptype == 3:  # PUBLISH
+                events.append(_mqtt_parse_publish(flags, body))
+        return "ok", events
+    finally:
+        sock.close()
+
+
+def print_gcu_events(events: list[tuple[str, str]]) -> None:
+    """打印 GCU 回报中与显示模式相关的关键字段。"""
+    for topic, payload in events:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        for key, label in (
+                ("CheckDGpuStatusforIGpuOnlyOnSuccess", "GCU 判据码（1=判「显卡使用中」拒绝）"),
+                ("IGpuOnlyConnectionSwitch_Status", "GCU 核显省电状态"),
+                ("currentSaveingMode", "GCU currentSaveingMode（不可信，仅参考）")):
+            if key in data:
+                print(f"  GCU 回报 {topic}: {key} = {data[key]}（{label}）")
 
 
 def wait_for_mode(target: str, timeout_sec: float = 180.0,
@@ -674,6 +800,9 @@ PROTECTED_PROCESSES = {
     # NVIDIA 服务/容器：SCM 托管，杀了自动复活（禁用对应服务才是根治）
     "nvcontainer.exe", "nvdisplay.container.exe", "nvidia overlay.exe",
     "nvidia share.exe", "nvidia web helper.exe",
+    # GCU 后台：MQTT 命令的接收与执行者（--eco 切换段依赖它），杀了断控制通道
+    # （2026-11-11 实测被误列驱动层候选强杀，靠服务自愈才没断；NVAPI 模块口径对它必中）
+    "gcuservice.exe", "gcubridge.exe", "ccuwinui.exe",
 }
 
 
@@ -811,12 +940,15 @@ class _Tee:
     """stdout 双写：终端 + 日志文件（提权新窗口跑完即关，输出必须留档）。"""
 
     def __init__(self, path: str):
-        self._f = open(path, "w", encoding="utf-8", errors="replace")
+        # 行缓冲：进程被强杀/崩溃时已打印内容仍在盘上（2026-11-11 实测教训：
+        # 块缓冲下被 taskkill，整轮失败诊断 0 字节丢失）
+        self._f = open(path, "w", encoding="utf-8", errors="replace", buffering=1)
         self._out = sys.stdout
 
     def write(self, s):
         self._out.write(s)
         self._f.write(s)
+        self._f.flush()
         return len(s)
 
     def flush(self):
@@ -857,9 +989,9 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
 
 
 def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
-    """切核显省电（真切换）：检测独显持有 → 清场 → 弹窗引导官方控制台操作 → 凭证验证。"""
+    """切核显省电（真切换）：检测独显持有 → 清场 → 发 GCU 同款 MQTT 命令 → 凭证验证。"""
     st = read_display_mode_state()
-    print("=== 核显省电切换编排（检测 → 清场 → 官方切换 → 凭证验证）===")
+    print("=== 核显省电切换编排（检测 → 清场 → 发送官方同款命令 → 凭证验证）===")
     print_mode_state(st)
     if st.mode == "igpu_only":
         print("\n已在核显省电态（PnP 已断开 + DXGI 不可见），无需切换。")
@@ -973,15 +1105,15 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     else:
         print("  ✓ 独显已无任何存活持有（图形上下文 + 驱动层双口径）")
 
-    # ④ 弹窗引导官方切换：占用杀绝后 GCU 判据可通过，控制台点击即真切换
-    if not popup_confirm(
-            "独显占用清场完成。\n\n"
-            "请打开「机械革命控制中心」→ 显卡设置，开启「核显省电模式」。\n"
-            "等控制台切换动作完成（不再转圈）后，点【确定】验证结果；\n"
-            "点【取消】放弃本次切换（已结束的进程不会自动恢复）。",
-            "请到控制中心开启核显省电"):
-        print("已取消切换（本次已结束的进程不自动恢复）。")
+    # ④ 发送官方同款切换命令（控制中心 UI 的同一条 MQTT 通道，GCUService 执行）
+    print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
+    status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
         return 1
+    print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON）")
+    print_gcu_events(events)
 
     print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
     res = wait_for_mode("igpu_only", timeout_sec=180.0)
@@ -991,6 +1123,9 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         return 0
     print("\nX 3 分钟内未检测到 EC 级断开，切换未完成。当前状态：")
     print_mode_state(res)
+    st2, ev2 = gcu_mqtt_command('{"Action": "GETSTATUS"}', listen_secs=4.0)
+    if st2 == "ok":
+        print_gcu_events(ev2)
     print("\n常见原因：清场后有软件重新拉起独显（图形上下文或 NVAPI 轮询），"
           "GCU 判据仍判「显卡使用中」。复查当前独显持有（双口径）：")
     time.sleep(0.5)
@@ -1001,12 +1136,12 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     print(f"--- 驱动层持有（{len(drv)} 个）---")
     for pid, name, mods in drv:
         print(f"  pid {pid:<7} {name}  [{', '.join(sorted(mods))}]")
-    print("可处理后再到控制台重试；或用 --status 随时查看当前模式。")
+    print("可处理后重跑 --eco 再试；或用 --status 随时查看当前模式。")
     return 1
 
 
 def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
-    """切回混合模式：确认省电态 → 弹窗引导官方控制台操作 → 凭证验证。
+    """切回混合模式：确认省电态 → 发送 GCU 同款 MQTT 命令 → 凭证验证。
 
     不杀进程、不动 PnP，无需提权。
     """
@@ -1019,13 +1154,14 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
     if st.mode != "igpu_only":
         print(f"\n当前模式不是核显省电态（{MODE_LABELS[st.mode]}），本命令只负责省电态 → 混合。")
         return 1
-    if not popup_confirm(
-            "请打开「机械革命控制中心」→ 显卡设置，切回「混合模式」。\n\n"
-            "等控制台切换动作完成（不再转圈）后，点【确定】验证独显已重新上线；\n"
-            "点【取消】放弃。",
-            "请到控制中心切回混合模式"):
-        print("已取消，未做任何改动。")
+    print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
+    status, events = gcu_mqtt_command(GCU_ECO_OFF_CMD, listen_secs=8.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
         return 1
+    print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_OFF）")
+    print_gcu_events(events)
     print("\n--- 验证切换（轮询 PnP problem code / DXGI / IGPUonly，上限 3 分钟）---")
     res = wait_for_mode("hybrid", timeout_sec=180.0)
     if res.mode == "hybrid":
@@ -1034,6 +1170,9 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         return 0
     print("\nX 3 分钟内独显未重新上线。当前状态：")
     print_mode_state(res)
+    st2, ev2 = gcu_mqtt_command('{"Action": "GETSTATUS"}', listen_secs=4.0)
+    if st2 == "ok":
+        print_gcu_events(ev2)
     print("可稍后重试，或用 --status 随时查看当前模式。")
     return 1
 
@@ -1047,8 +1186,9 @@ def main() -> int:
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
     ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off"],
                     metavar="{on,off}",
-                    help="显示模式切换编排：on = 检测独显占用并清场后，弹窗引导到官方控制中心"
-                         "开启核显省电并自动验证（默认）；off = 弹窗引导切回混合模式并验证")
+                    help="显示模式切换编排（全程自动，GCU 控制通道与控制中心同路线）："
+                         "on = 检测独显占用并清场后发官方同款命令开启核显省电并验证（默认）；"
+                         "off = 发命令切回混合模式并验证")
     ap.add_argument("--status", action="store_true",
                     help="报告当前显示模式与凭证（PnP problem code / DXGI / GCU 注册表）")
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")

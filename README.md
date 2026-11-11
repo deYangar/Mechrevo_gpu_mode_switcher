@@ -15,8 +15,8 @@ python dgpu_detective.py --watch        # 持续监视独显，新持有进程�
 python dgpu_detective.py --watch --interval 2
 python dgpu_detective.py --json         # 一次性 JSON 快照
 python dgpu_detective.py --status       # 当前显示模式与凭证（PnP / DXGI / GCU 注册表）
-python dgpu_detective.py --eco          # 核显省电一键切换（检测→清场→引导官方切换→验证）
-python dgpu_detective.py --eco off      # 切回混合模式（引导官方切换→验证）
+python dgpu_detective.py --eco          # 核显省电一键切换（检测→清场→发官方同款命令→验证，全自动）
+python dgpu_detective.py --eco off      # 切回混合模式（发官方同款命令→验证）
 ```
 
 仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll`），无需管理员权限。
@@ -67,9 +67,12 @@ D3D / Vulkan / OpenGL / CUDA 全都过这一层（GeForce WDDM 模式下 nvidia-
 
 ### 核显省电切换（--eco）
 
-把「找出占用 → 清场 → 官方切换 → 验证」串成一条命令。**真切换由机械革命控制
-中心的官方路径完成**（占用杀绝后 GCU 判据即可通过，控制台点击即 EC 级下线），
-本工具负责清场与前后验证，不再走 PnP 软禁用（那是假切换）：
+把「找出占用 → 清场 → 切换 → 验证」串成一条全自动命令。**切换走机械革命控制
+中心自己的通道**（2026-11-11 挖明架构：控制中心 UI → GCUBridge（127.0.0.1:13688，
+MQTT broker）→ GCUService 执行全套官方逻辑）。本工具内置纯标准库 MQTT 客户端，
+向 `Setting/Control` 发布与控制中心点击完全相同的命令（`IGPU_ONLY_CONNECT_RB_ON`），
+GCUService 收令后的判据检查、NV 服务联动、EC 写入、超时回滚与人工点击一字不差；
+不再走 PnP 软禁用（那是假切换），也无需再到控制中心手动点击：
 
 1. **前置状态检测**：已在省电态 → 直接退出；检测到 PnP 软禁用残留 → 提示先恢复
 2. **检测（双口径）**：
@@ -79,24 +82,31 @@ D3D / Vulkan / OpenGL / CUDA 全都过这一层（GeForce WDDM 模式下 nvidia-
      创建图形上下文，WDDM 与 nvidia-smi 都看不见它们，但 GCU「显卡使用中」判据
      看得到（2026-11-11 实测：HWiNFO 开着切换被拒、关掉即成功）——扫描全系统
      进程加载的 nvapi/nvml/nvspcaps 模块补上这个盲区
-3. **分类提示**：用户软件列为候选；系统/服务组件（dwm / explorer / nvcontainer
-   等）只列出不动——杀了会被系统拉回，且实测不阻碍官方切换
+3. **分类提示**：用户软件列为候选；系统/服务组件（dwm / explorer / nvcontainer /
+   GCU 后台等）只列出不动——杀了会被系统拉回或断控制通道，且实测不阻碍官方切换
 4. **关闭**：确认后按进程名 `taskkill /F /T /IM` 强杀——**全部同名实例与各自的
    进程树一起结束**（覆盖同名子进程场景）；taskkill 结果如实显示
 5. **复查（双口径）**：重新采样 + 模块重扫；同名新 pid / 重新加载标
    「被守护/自启拉回」，其余残留如实报告
-6. **弹窗引导官方切换**：弹置顶选择窗，到「机械革命控制中心」开「核显省电模式」，
-   操作完成后点【确定】
+6. **发送切换命令**：MQTT 发布官方同款命令并接收 GCU 回报（判据码
+   `CheckDGpuStatusforIGpuOnlyOnSuccess`，1 = GCU 判「显卡使用中」拒绝）；
+   通道不可用（GCUBridge / GCUService 未运行）则如实报错
 7. **凭证验证**：轮询 PnP/DXGI/IGPUonly（上限 3 分钟），EC 级断开即成功；
-   超时则如实报告当前状态并双口径复查独显持有（定位是谁又扑上来挡了判据）
+   超时则如实报告当前状态、查询 GCU 判据码并双口径复查独显持有
+   （定位是谁又扑上来挡了判据）
 
 `--eco`（on 方向）开头即提权（UAC 一次）：HwMonitor/GamePP 等硬件监控多以管理员
-运行，不提权 taskkill 直接被拒。每一步都有确认环节，随时可取消。
+运行，不提权 taskkill 直接被拒。清场环节有确认，随时可取消。
+
+已知暂态：`--eco off` 后 1 分钟内立刻 `--eco` 可能被 GCU 判据拒绝——off 刚把 NV
+服务拉起，紧随的 on 撞上服务自停的残留上下文（2026-11-11 实测：15:45 被拒、
+15:48 同环境即成功）。隔 2 分钟再试即过。
 
 ### 切回混合模式（--eco off）
 
-当前在省电态时可用：弹窗引导到控制中心切回「混合模式」，轮询验证独显重新在线
-（PnP 在线 + DXGI 重现）。不杀进程、不动 PnP，无需提权。
+当前在省电态时可用：MQTT 发送 `IGPU_ONLY_CONNECT_RB_OFF`（与控制中心点击同路线），
+轮询验证独显重新在线（PnP 在线 + DXGI 重现，2026-11-11 实测 6 秒完成）。
+不杀进程、不动 PnP，无需提权。
 
 ## 独显关不掉的排查思路
 

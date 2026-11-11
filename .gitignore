@@ -7,3 +7,10 @@ mod_scan.py
 probe_*.txt
 mod_elev.txt
 eco_test.txt
+mqtt_probe.py
+switch_test.py
+run_eco.ps1
+on_test2.log
+nv_handle_probe.py
+mod_scan.py
+probe_*.txt
