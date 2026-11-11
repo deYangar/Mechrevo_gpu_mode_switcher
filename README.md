@@ -14,6 +14,8 @@ python dgpu_detective.py --all          # 核显等非独显适配器也一并�
 python dgpu_detective.py --watch        # 持续监视独显，新持有进程冒头即时报告
 python dgpu_detective.py --watch --interval 2
 python dgpu_detective.py --json         # 一次性 JSON 快照
+python dgpu_detective.py --eco          # 核显省电一键切换：列出占用→确认关闭→移交 gpu_switch
+python dgpu_detective.py --eco --gpu-switch <路径>   # 指定 gpu_switch.py 位置
 ```
 
 仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll`），无需管理员权限。
@@ -46,6 +48,24 @@ D3D / Vulkan / OpenGL / CUDA 全都过这一层（GeForce WDDM 模式下 nvidia-
 - 引擎利用率是 rate 计数器，一次性模式自动垫 0.5s 采样间隔
 - `<拒绝访问 pid=N>` = 受保护进程（驱动/反作弊等），普通权限查不到名字
 - pid 4 = System 内核进程
+
+## 核显省电一键切换（--eco）
+
+配合 `gpu_mode_switch` 项目的 `gpu_switch.py`（官方同款终态序列 CLI）使用，把
+「找出占用 → 关软件 → 切换」串成一条命令：
+
+1. **检测**：WDDM 口径抓独显全部持有进程（比 nvidia-smi 全，含 0 显存纯上下文
+   持有者），自动过滤已退出的陈旧计数器实例
+2. **分类提示**：用户软件列为「可关闭候选」；系统/服务组件（dwm / explorer /
+   nvcontainer 等）只列出不动——杀了会被系统拉回，且实测不阻碍 PnP 禁用
+3. **关闭**：确认后 `taskkill` 优雅关闭（等效点窗口的 X）；退不掉的经确认才
+   强杀，有引擎活动的进程标 ⚠ 警告丢数据
+4. **复查**：重新采样，如实报告剩余持有（系统组件残留不阻碍切换）
+5. **切换**：确认后调 `gpu_switch.py on`（自身弹 UAC），完成 PnP 禁用 +
+   json/注册表/GCU 状态同步
+
+每一步都有确认环节，随时可取消；检测/关闭环节无需管理员权限，仅最后的切换
+经 gpu_switch 提权。
 
 ## 独显关不掉的排查思路
 

@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -459,6 +461,203 @@ def watch(counters: GpuCounters, adapters_meta: list[Adapter], interval: float) 
         print("\n监视结束。")
 
 
+# ---------------------------------------------------------------------------
+# 核显省电切换编排（--eco）：检测独显持有 → 提示并关闭 → 移交 gpu_switch on
+# ---------------------------------------------------------------------------
+
+# gpu_switch.py（gpu_mode_switch 项目，官方同款终态序列 CLI）默认位置，--gpu-switch 可覆盖
+GPU_SWITCH_DEFAULT = (r"C:\Users\Yang\.zcode\workspace\default\projects"
+                      r"\gpu_mode_switch\tools\gpu_switch.py")
+
+# 系统/服务组件：杀了会被系统拉回或影响桌面（输入/开始菜单/窗口管理），且 gpu_mode_switch
+# 的 E7 实测「独显上下文进程不阻碍 PnP 禁用」——只列出说明，不自动关闭
+PROTECTED_PROCESSES = {
+    "system", "dwm.exe", "explorer.exe", "csrss.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "sihost.exe", "fontdrvhost.exe",
+    "runtimebroker.exe", "textinputhost.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "searchhost.exe", "searchindexer.exe",
+    "applicationframehost.exe", "systemsettings.exe", "widgetservice.exe",
+    # NVIDIA 服务/容器：SCM 托管，杀了自动复活（禁用对应服务才是根治）
+    "nvcontainer.exe", "nvdisplay.container.exe", "nvidia overlay.exe",
+    "nvidia share.exe", "nvidia web helper.exe",
+}
+
+
+def classify_pid(pid: int) -> tuple[bool, bool]:
+    """进程状态分类，返回 (存活, 受保护)。
+
+    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) 被拒 err=5 是受保护进程（活着）；
+    err=87 等 = pid 已不存在——PDH 计数器里残留的陈旧实例。
+    """
+    if pid == 4:
+        return True, True  # System 内核进程
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k = _load_kernel32()
+    h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if h:
+        k.CloseHandle(h)
+        return True, False
+    if ctypes.get_last_error() == 5:  # ERROR_ACCESS_DENIED：受保护进程
+        return True, True
+    return False, False  # pid 已不存在（陈旧实例）
+
+
+def is_admin() -> bool:
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def ask(prompt: str, default: str = "") -> str:
+    """CLI 问答；管道喂空（EOF）视同默认值（默认都是「不动作」，安全）。"""
+    try:
+        return input(f"{prompt}: ").strip()
+    except EOFError:
+        return default
+
+
+def ask_yes_no(prompt: str) -> bool:
+    return ask(f"{prompt} [y/N]").lower() in ("y", "yes")
+
+
+def graceful_close(pid: int, timeout: float = 3.0) -> bool:
+    """taskkill 不带 /f（对窗口进程等效 WM_CLOSE），轮询等待退出。"""
+    subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        alive, _ = classify_pid(pid)
+        if not alive:
+            return True
+    return False
+
+
+def force_kill(pid: int) -> bool:
+    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+    time.sleep(1.0)
+    alive, _ = classify_pid(pid)
+    return not alive
+
+
+def proc_name(image: str) -> str:
+    return image.rsplit("\\", 1)[-1]
+
+
+def active_engines(row: dict) -> dict[str, float]:
+    """有真实利用率的引擎（阈值与 print_report 一致）。"""
+    return {k: v for k, v in row["engines"].items() if v > 0.05}
+
+
+def print_eco_rows(rows: list[dict], title: str) -> None:
+    print(f"\n--- {title} ---")
+    if not rows:
+        print("  （无）")
+        return
+    name_w = max(len(proc_name(r["image"])) for r in rows)
+    for r in rows:
+        active = active_engines(r)
+        eng = " ".join(f"{k} {v:.0f}%" for k, v in active.items()) or "仅上下文"
+        mark = "  ⚠活动中（强杀可能丢未保存数据）" if active else ""
+        print(f"  pid {r['pid']:<7} {proc_name(r['image']):<{name_w}}"
+              f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{mark}")
+
+
+def close_candidates(candidates: list[dict]) -> None:
+    """优雅关闭候选进程；退不掉的列出，经确认后才强杀。"""
+    print("\n--- 优雅关闭（taskkill，等效点窗口的 X）---")
+    stubborn: list[dict] = []
+    for r in candidates:
+        pid = r["pid"]
+        print(f"  … {proc_name(r['image'])} (pid {pid})", end="", flush=True)
+        if graceful_close(pid):
+            print(" ✓ 已退出")
+        else:
+            print(" ✗ 未退出")
+            stubborn.append(r)
+    if not stubborn:
+        return
+    print_eco_rows(stubborn, f"未能优雅退出（{len(stubborn)} 个）")
+    if ask_yes_no(f"强制结束以上 {len(stubborn)} 个进程？"):
+        for r in stubborn:
+            pid = r["pid"]
+            ok = force_kill(pid)
+            tail = "" if ok else " —— 残留（不阻碍切换，上下文将被强制剥离）"
+            print(f"  {'✓' if ok else '✗'} 强杀 {proc_name(r['image'])} (pid {pid}){tail}")
+    else:
+        print("  跳过强杀（残留不阻碍切换，上下文将被强制剥离）")
+
+
+def cmd_eco(counters: GpuCounters, adapters_meta: list[Adapter], gpu_switch_path: str) -> int:
+    """核显省电切换编排：检测独显持有 → 提示并关闭 → 复查 → 移交 gpu_switch on。"""
+    print("=== 核显省电切换编排（检测 → 清场 → gpu_switch on）===")
+    switch_ready = os.path.isfile(gpu_switch_path)
+    if not switch_ready:
+        print(f"! 未找到 gpu_switch.py：{gpu_switch_path}")
+        print("  检测/关闭环节照常可用；切换环节无法执行（--gpu-switch 可指定路径）")
+
+    # ① 抓独显持有清单，按可关闭/系统组件分类（过滤已退出的陈旧实例）
+    time.sleep(0.5)  # 引擎利用率是 rate 计数器，需要真实间隔才有读数
+    candidates: list[dict] = []  # 用户软件，可关闭候选
+    skipped: list[dict] = []     # 系统/服务/受保护组件
+    stale = 0
+    for gpu in sample_once(counters, adapters_meta, include_all=False):
+        for r in gpu["processes"]:
+            alive, protected = classify_pid(r["pid"])
+            if not alive:
+                stale += 1
+                continue
+            if protected or proc_name(r["image"]).lower() in PROTECTED_PROCESSES \
+                    or r["image"].startswith("<"):
+                skipped.append(r)
+            else:
+                candidates.append(r)
+    if stale:
+        print(f"（已过滤陈旧计数器实例 {stale} 个：进程已退出）")
+
+    # ② 分类提示 + 选择
+    candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
+    if candidates:
+        print_eco_rows(candidates, f"可关闭候选（{len(candidates)} 个，按显存排序）")
+        print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或不阻碍禁用）")
+        choice = ask("\n[1] 关闭以上候选并切换  [2] 不关闭直接切换  [回车/其他] 取消")
+        if choice == "1":
+            close_candidates(candidates)
+        elif choice != "2":
+            print("已取消，未做任何改动。")
+            return 1
+    else:
+        print("独显当前无用户软件持有 GPU 上下文，无需关闭。")
+        print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，不阻碍切换）")
+
+    # ③ 复查：重新采样，如实报告剩余持有
+    print("\n--- 复查（重新采样）---")
+    time.sleep(2.0)  # 给 WDDM 上下文销毁、计数器实例消失留时间
+    remaining = []
+    for gpu in sample_once(counters, adapters_meta, include_all=False):
+        for r in gpu["processes"]:
+            alive, _ = classify_pid(r["pid"])
+            if alive:
+                remaining.append(r)
+    if remaining:
+        print_eco_rows(remaining, f"剩余持有 {len(remaining)} 个（多为系统组件，不阻碍 PnP 禁用）")
+    else:
+        print("  ✓ 独显已无任何存活持有进程")
+
+    # ④ 移交 gpu_switch 切换
+    if not switch_ready:
+        print(f"\nX gpu_switch.py 不存在（{gpu_switch_path}），清场完成但切换未执行。")
+        return 1
+    if not ask_yes_no("\n开始切换核显省电（gpu_switch on，需管理员/UAC）？"):
+        print("已取消切换（本次已关闭的进程不自动恢复）。")
+        return 1
+    print(f"\n--- 移交 gpu_switch：{gpu_switch_path} on ---")
+    if not is_admin():
+        print("当前非管理员：gpu_switch 将弹 UAC 在新窗口执行，"
+              "日志见 gpu_mode_switch/evidence/gpu_switch/。")
+    return subprocess.run([sys.executable, gpu_switch_path, "on"]).returncode
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="识别哪个进程在占用独立显卡（WDDM 性能计数器，任务管理器同款数据）")
@@ -466,6 +665,10 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="非独显适配器（核显等）也一并报告")
     ap.add_argument("--json", action="store_true", help="JSON 输出（一次性快照）")
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
+    ap.add_argument("--eco", action="store_true",
+                    help="核显省电切换编排：列出独显占用软件并关闭后，调 gpu_switch 切换")
+    ap.add_argument("--gpu-switch", default=GPU_SWITCH_DEFAULT, metavar="PATH",
+                    help="--eco 调用的 gpu_switch.py 路径（默认指向 gpu_mode_switch 项目）")
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")
     args = ap.parse_args()
 
@@ -486,6 +689,8 @@ def main() -> int:
         return 1
 
     try:
+        if args.eco:
+            return cmd_eco(counters, adapters_meta, args.gpu_switch)
         if args.watch:
             watch(counters, adapters_meta, args.interval)
             return 0
