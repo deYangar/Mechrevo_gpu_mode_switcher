@@ -1,4 +1,4 @@
-"""exe 冒烟测试（提权运行）：launch → 找窗口 → 屏幕外断言 → PrintWindow 截图 → 干净退出。
+r"""exe 冒烟测试（提权运行）：launch → 找窗口 → 屏幕外断言 → PrintWindow 截图 → 干净退出。
 
 产物：exe 吐窗口但必须在屏幕外（DGPU_TEST_OFFSCREEN 钩子）；截图非空白；
 6 秒存活（采样线程跑着）；WM_CLOSE 干净退出。
@@ -138,9 +138,18 @@ def main() -> int:
     t0 = time.time()
     while time.time() - t0 < 25:
         cands = [h for h in enum_windows() if h not in pre]
-        if cands:
-            hwnd = cands[0]
+        # 只认屏幕外的新窗口：咩咩自己开着的同标题窗口在屏内，不能断言到它头上
+        ours = [h for h in cands if is_offscreen(h)]
+        if ours:
+            hwnd = ours[0]
             break
+        if cands and time.time() - t0 > 8:
+            # 有新标题窗口但全在屏内：钩子失效（或被用户窗口干扰），如实报失败
+            check("窗口出现（屏幕外）", False,
+                  f"新窗口 {len(cands)} 个全在屏内（钩子失效或用户窗口干扰），不测它们")
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+            _finish(results)
+            return 1
         if p.poll() is not None:
             break
         time.sleep(0.3)
