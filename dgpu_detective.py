@@ -321,6 +321,8 @@ def _load_kernel32():
                                                  wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
         k.QueryFullProcessImageNameW.restype = wintypes.BOOL
         k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         _kernel32 = k
     return _kernel32
 
@@ -694,6 +696,84 @@ def classify_pid(pid: int) -> tuple[bool, bool]:
     return False, False  # pid 已不存在（陈旧实例）
 
 
+# ---------------------------------------------------------------------------
+# 驱动层持有者检测：NVAPI/NVML 模块加载者（GCU「显卡使用中」判据的观察口径）
+# ---------------------------------------------------------------------------
+# 2026-11-11 实测：HWiNFO 轮询 GPU 传感器不创建 WDDM 图形上下文，WDDM 计数器与
+# nvidia-smi 都抓不到它，但它加载着 nvapi64.dll/nvml.dll 直连驱动，控制台判据
+# 因此拒绝切换（关闭 HWiNFO 后同操作一次成功）。此口径补上这个盲区。
+# 注意：需提权才能读到 SYSTEM/提权进程的模块；进程用完即卸载的临时加载抓不到。
+
+NV_MODULE_MARKS = ("nvapi", "nvml", "nvspcaps")  # 模块名包含即算 NVIDIA 用户态接口
+
+
+class _MEW(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD), ("th32ModuleID", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD), ("GlblcntUsage", wintypes.DWORD),
+        ("ProccntUsage", wintypes.DWORD), ("modBaseAddr", ctypes.c_void_p),
+        ("modBaseSize", wintypes.DWORD), ("hModule", wintypes.HMODULE),
+        ("szModule", ctypes.c_wchar * 256),
+        ("szExePath", ctypes.c_wchar * 260),
+    ]
+
+
+def _list_pids() -> list[int]:
+    """psapi EnumProcesses 全量 pid。"""
+    psapi = ctypes.WinDLL("psapi")
+    psapi.EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    arr = (wintypes.DWORD * 2048)()
+    needed = wintypes.DWORD(0)
+    if not psapi.EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(needed)):
+        return []
+    return [arr[i] for i in range(needed.value // ctypes.sizeof(wintypes.DWORD))]
+
+
+def nv_modules_of(pid: int) -> set[str]:
+    """pid 加载的 NVIDIA 用户态接口模块（nvapi/nvml/nvspcaps）；快照打不开返回空集。"""
+    k = _load_kernel32()
+    for fn in ("Module32FirstW", "Module32NextW"):
+        f = getattr(k, fn)
+        f.restype = wintypes.BOOL
+        f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    INVALID = ctypes.c_void_p(-1).value
+    msnap = k.CreateToolhelp32Snapshot(0x8 | 0x10, pid)  # MODULE | MODULE32
+    if not msnap or msnap == INVALID:
+        return set()
+    try:
+        me = _MEW()
+        me.dwSize = ctypes.sizeof(_MEW)
+        out: set[str] = set()
+        ok = k.Module32FirstW(msnap, ctypes.byref(me))
+        while ok:
+            mod = me.szModule.lower()
+            if any(m in mod for m in NV_MODULE_MARKS):
+                out.add(me.szModule)
+            ok = k.Module32NextW(msnap, ctypes.byref(me))
+        return out
+    finally:
+        k.CloseHandle(msnap)
+
+
+def nv_module_holders(exclude_names: set[str]) -> list[tuple[int, str, set[str]]]:
+    """全系统扫描 NVAPI/NVML 模块持有者，返回 [(pid, 进程名, 模块集)]。
+
+    exclude_names 按映像名小写排除（保护名单——系统/NVIDIA 自家组件杀了会被拉回）。
+    """
+    out: list[tuple[int, str, set[str]]] = []
+    for pid in _list_pids():
+        mods = nv_modules_of(pid)
+        if not mods:
+            continue
+        image = process_image(pid)
+        name = proc_name(image) if not image.startswith("<") else image
+        if name.lower() in exclude_names:
+            continue
+        out.append((pid, name, mods))
+    return out
+
+
 def is_admin() -> bool:
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
@@ -795,20 +875,36 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     if stale:
         print(f"（已过滤陈旧计数器实例 {stale} 个：进程已退出）")
 
+    # ①b 驱动层口径：NVAPI/NVML 模块持有者。传感器轮询类软件（HWiNFO 等）不创建
+    #     WDDM 图形上下文，① 抓不到它们，但 GCU 判据看得到（2026-11-11 实测教训）
+    wddm_pids = {r["pid"] for r in candidates} | {r["pid"] for r in skipped}
+    drv_holders = [(pid, name, mods) for pid, name, mods in
+                   nv_module_holders(PROTECTED_PROCESSES)
+                   if pid not in wddm_pids]
+
     # ② 分类提示 + 选择；关闭 = 按进程名强杀全部同名实例（含子进程树）
     candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
     handled_pids: set[int] = set()
     handled_names: set[str] = set()
-    if candidates:
-        print_eco_rows(candidates, f"可关闭候选（{len(candidates)} 个，按显存排序）")
+    if candidates or drv_holders:
+        if candidates:
+            print_eco_rows(candidates, f"图形上下文持有（{len(candidates)} 个，按显存排序）")
+        if drv_holders:
+            print(f"\n--- 驱动层持有（{len(drv_holders)} 个，NVAPI/NVML 模块加载者："
+                  "不占图形上下文但挡切换判据）---")
+            name_w = max(len(n) for _, n, _ in drv_holders)
+            for pid, name, mods in drv_holders:
+                print(f"  pid {pid:<7} {name:<{name_w}}  [{', '.join(sorted(mods))}]")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或系统组件）")
         choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
                      "  [2] 不关闭直接继续  [回车/其他] 取消")
         if choice == "1":
-            names = sorted({proc_name(r["image"]) for r in candidates})
+            names = sorted({proc_name(r["image"]) for r in candidates} |
+                           {name for _, name, _ in drv_holders})
             print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
-            handled_pids = {r["pid"] for r in candidates}
-            handled_names = {proc_name(r["image"]).lower() for r in candidates}
+            handled_pids = {r["pid"] for r in candidates} | {p for p, _, _ in drv_holders}
+            handled_names = ({proc_name(r["image"]).lower() for r in candidates} |
+                             {name.lower() for _, name, _ in drv_holders})
             for name in names:
                 ok, msg = kill_by_name(name)
                 tail = "" if ok else f" —— {msg[:120]}"
@@ -817,10 +913,10 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
             print("已取消，未做任何改动。")
             return 1
     else:
-        print("独显当前无用户软件持有 GPU 上下文，无需关闭。")
+        print("独显当前无用户软件持有 GPU 上下文或 NVAPI 句柄，无需关闭。")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，不阻碍切换）")
 
-    # ③ 复查：重新采样；同名新 pid = 被守护/自启拉回
+    # ③ 复查：重新采样 + 模块重扫；同名新 pid / 重新加载 = 被守护/自启拉回
     print("\n--- 复查（重新采样）---")
     time.sleep(2.0)  # 给 WDDM 上下文销毁、计数器实例消失留时间
     remaining = []
@@ -834,11 +930,21 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
             elif proc_name(r["image"]).lower() in handled_names:
                 r["_note"] = "被守护/自启拉回（新 pid），建议软件内退出或禁自启"
             remaining.append(r)
-    if remaining:
-        print_eco_rows(remaining, f"剩余持有 {len(remaining)} 个（系统组件不阻碍切换；"
-                                  "若下面切换失败，优先怀疑其余用户软件又扑上来挡判据）")
+    drv_left = nv_module_holders(PROTECTED_PROCESSES)
+    drv_notes = []
+    for pid, name, mods in drv_left:
+        note = "（被守护/自启拉回），建议软件内退出或禁自启" \
+            if name.lower() in handled_names else ""
+        drv_notes.append(f"  pid {pid:<7} {name}  [{', '.join(sorted(mods))}]{note}")
+    if remaining or drv_notes:
+        print_eco_rows(remaining, f"图形上下文剩余 {len(remaining)} 个（系统组件不阻碍切换）")
+        if drv_notes:
+            print(f"驱动层剩余 {len(drv_notes)} 个（挡判据，切换前建议处理）：")
+            for line in drv_notes:
+                print(line)
+        print("（若下面切换失败，优先怀疑又有软件扑上来挡判据）")
     else:
-        print("  ✓ 独显已无任何存活持有进程")
+        print("  ✓ 独显已无任何存活持有（图形上下文 + 驱动层双口径）")
 
     # ④ 弹窗引导官方切换：占用杀绝后 GCU 判据可通过，控制台点击即真切换
     if not popup_confirm(
@@ -858,12 +964,16 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         return 0
     print("\nX 3 分钟内未检测到 EC 级断开，切换未完成。当前状态：")
     print_mode_state(res)
-    print("\n常见原因：清场后有软件重新拉起独显上下文，GCU 判据仍判「显卡使用中」。")
-    print("复查当前独显持有：")
+    print("\n常见原因：清场后有软件重新拉起独显（图形上下文或 NVAPI 轮询），"
+          "GCU 判据仍判「显卡使用中」。复查当前独显持有（双口径）：")
     time.sleep(0.5)
     print_eco_rows([r for gpu in sample_once(counters, adapters_meta, include_all=False)
                     for r in gpu["processes"] if classify_pid(r["pid"])[0]],
-                   "当前持有（全部）")
+                   "图形上下文持有（全部）")
+    drv = nv_module_holders(PROTECTED_PROCESSES)
+    print(f"--- 驱动层持有（{len(drv)} 个）---")
+    for pid, name, mods in drv:
+        print(f"  pid {pid:<7} {name}  [{', '.join(sorted(mods))}]")
     print("可处理后再到控制台重试；或用 --status 随时查看当前模式。")
     return 1
 
