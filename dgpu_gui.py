@@ -46,8 +46,11 @@ def co_init() -> None:
 
 
 def taskkill_pid(pid: int) -> tuple[bool, str]:
-    """taskkill /F /T /PID：结束单个进程及其子进程树；错误原文返回，不吞。"""
+    """taskkill /F /T /PID：结束单个进程及其子进程树；错误原文返回，不吞。
+    返回码 128 = 进程已不在（常见于刚按名批量杀过、树已退出），按已结束算成功。"""
     r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+    if r.returncode == 128:
+        return True, ""
     msg = (r.stderr or r.stdout or b"").decode("gbk", "replace").strip().replace("\n", " | ")
     return r.returncode == 0, msg
 
@@ -333,7 +336,8 @@ class App:
         try:
             while not self.stop_evt.is_set():
                 active = self._auto and not self._paused
-                if active or self._manual_req:
+                # 切换期间彻底暂停（_manual_req 也挡住，留到恢复后补一轮采样）
+                if active or (self._manual_req and not self._paused):
                     self._manual_req = False
                     t0 = time.monotonic()
                     self._sample_once_send(counters)
@@ -348,6 +352,13 @@ class App:
                 pass
 
     def _sample_once_send(self, counters):
+        try:
+            # 每轮重枚举：切换显示模式后适配器会消失/重现（LUID 可能变化），
+            # 启动时的快照在「省电→混合」循环后会失配（独显行永远查不到）；
+            # 枚举失败（DXGI 瞬时异常）沿用上次列表
+            self.adapters = eng.enumerate_adapters()
+        except OSError:
+            pass
         try:
             data = eng.sample_once(counters, self.adapters, self._include_all)
             st = eng.read_display_mode_state()
@@ -424,8 +435,10 @@ class App:
         if sel_iid and self.tree.exists(sel_iid):
             self.tree.selection_set(sel_iid)
 
-        # GPU 概要条
+        # GPU 概要条（适配器消失时撤 chip：切核显省电后独显从 DXGI 层消失）
+        seen_luids = set()
         for gpu in data:
+            seen_luids.add(gpu["luid"])
             mem_l, eng_l = self._chip(gpu["luid"], gpu["name"], gpu["discrete"])
             mem_l.config(text=f"显存 {gpu['adapter_dedicated_mb']:.2f} / "
                               f"{gpu['card_vram_mb']:.2f} MB")
@@ -436,6 +449,10 @@ class App:
                         best_k, best_v = k, v
             peak = f"引擎峰值 {best_k} {best_v:.1f}%" if best_v > 0.05 else "引擎空闲"
             eng_l.config(text=f"{len(gpu['processes'])} 持有 · {peak}")
+        for luid in list(self.chips):
+            if luid not in seen_luids:
+                self.chips[luid][0].master.destroy()  # 撤掉已消失适配器的 LabelFrame
+                del self.chips[luid]
 
         self._apply_status(st)
         extra = f"｜ 新持有 {new_count}" if new_count else ""
@@ -556,7 +573,7 @@ class App:
     def _on_interval(self):
         try:
             v = float(self.interval_spin.get())
-            if 0.2 <= v <= 30.0:
+            if 0.5 <= v <= 10.0:  # 与 Spinbox 范围一致；太短 rate 计数器读数不稳
                 self._interval = v
         except ValueError:
             pass
@@ -587,7 +604,8 @@ class App:
     def run_eco(self, target: str):
         if self.eco_running:
             return
-        if not eng.is_admin():
+        if target == "on" and not eng.is_admin():
+            # off（恢复混合）不杀进程不动 PnP，无需提权（与 CLI cmd_eco_off 口径一致）
             messagebox.showwarning(
                 "独显占用侦探",
                 "未以管理员运行：清场要杀以管理员运行的软件（HWiNFO 等），切不动。\n"
@@ -692,13 +710,13 @@ class App:
     # ------------------------------------------------------------- 日志面板
 
     def _drain_log(self):
+        at_bottom = self.log_text.yview()[1] > 0.98  # 排空前是否贴底，整批统一判断
         n = 0
         while True:
             try:
                 s = self.log_q.get_nowait()
             except queue.Empty:
                 break
-            at_bottom = self.log_text.yview()[1] > 0.98
             self.log_text.config(state="normal")
             self.log_text.insert("end", s)
             if int(self.log_text.index("end-1c").split(".")[0]) > 3000:
@@ -721,6 +739,12 @@ class App:
     # ------------------------------------------------------------- 退出
 
     def _on_close(self):
+        if self.eco_running:
+            if not messagebox.askyesno(
+                    "独显占用侦探",
+                    "切换编排正在进行（详见切换日志），现在退出可能停在"
+                    "「清了场没切完」的中间态。\n确定退出吗？"):
+                return
         self.stop_evt.set()
         self.root.destroy()
 

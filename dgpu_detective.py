@@ -285,8 +285,8 @@ class GpuCounters:
             for name, val in self._read(attr):
                 m = _PROC_RE.match(name)
                 if m:
-                    setattr(proc(luid_key(m[2], m[3]), int(m[1])), attr,
-                            getattr(procs[luid_key(m[2], m[3])][int(m[1])], attr) + val)
+                    p = proc(luid_key(m[2], m[3]), int(m[1]))
+                    setattr(p, attr, getattr(p, attr) + val)
         for name, val in self._read("engine"):
             m = _ENGINE_RE.match(name)
             if m:
@@ -325,6 +325,10 @@ def _load_kernel32():
         k.CloseHandle.argtypes = [wintypes.HANDLE]
         k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
         k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        for _fn in ("Module32FirstW", "Module32NextW"):
+            _f = getattr(k, _fn)
+            _f.restype = wintypes.BOOL
+            _f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         _kernel32 = k
     return _kernel32
 
@@ -397,8 +401,8 @@ def print_report(gpus: list[dict]) -> None:
         print(f"\n=== {gpu['name']}（{gpu['vendor']}，{tag}，LUID {gpu['luid']}）===")
         used = gpu["adapter_dedicated_mb"]
         card = gpu["card_vram_mb"]
-        print(f"适配器显存占用: {fmt_mb(used * 1024 * 1024)} MB / {fmt_mb(card * 1024 * 1024)} MB"
-              f"（共享内存 {fmt_mb(gpu['adapter_shared_mb'] * 1024 * 1024)} MB）")
+        print(f"适配器显存占用: {used:.2f} MB / {card:.2f} MB"
+              f"（共享内存 {gpu['adapter_shared_mb']:.2f} MB）")
         rows = gpu["processes"]
         if not rows:
             print("  无任何进程持有此显卡的 GPU 上下文。")
@@ -433,6 +437,7 @@ def print_list_gpus(adapters: list[Adapter]) -> None:
 def watch(counters: GpuCounters, adapters_meta: list[Adapter], interval: float) -> None:
     """持续盯独显：新持有进程冒头/退出即时报告，每轮打印简报。"""
     print(f"开始监视（每 {interval:g}s 一轮，Ctrl+C 退出）…", flush=True)
+    name_by_luid = {a.luid: a.name for a in adapters_meta}
     seen: dict[tuple[int, int], float] = {}  # (luid, pid) -> 上次 local_mb
     try:
         while True:
@@ -448,13 +453,13 @@ def watch(counters: GpuCounters, adapters_meta: list[Adapter], interval: float) 
             for key, v in now.items():
                 if key not in seen:
                     luid, pid = key
-                    gname = next((a.name for a in adapters_meta if a.luid == luid), "?")
+                    gname = name_by_luid.get(luid, "?")
                     img = process_image(pid).rsplit("\\", 1)[-1]
                     print(f"[{stamp}] 新持有: {img} (pid {pid}) → {gname}，VRAM {fmt_mb(v)} MB", flush=True)
             for key in seen:
                 if key not in now:
                     luid, pid = key
-                    gname = next((a.name for a in adapters_meta if a.luid == luid), "?")
+                    gname = name_by_luid.get(luid, "?")
                     print(f"[{stamp}] 退出: pid {pid} 已不再持有 {gname}", flush=True)
             seen = now
             dgpu = [(a, procs.get(a.luid, {})) for a in adapters_meta if a.discrete]
@@ -495,6 +500,23 @@ MODE_LABELS = {
 }
 
 
+_cfgmgr32 = None
+
+
+def _load_cfgmgr32():
+    """cfgmgr32 惰性单例——GUI 每秒读显示模式都要判 devnode，别每次重建 DLL 对象。"""
+    global _cfgmgr32
+    if _cfgmgr32 is None:
+        cfg = ctypes.WinDLL("cfgmgr32")
+        cfg.CM_Locate_DevNodeW.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                           wintypes.LPCWSTR, wintypes.UINT]
+        cfg.CM_Get_DevNode_Status.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                              ctypes.POINTER(wintypes.DWORD),
+                                              wintypes.DWORD, wintypes.UINT]
+        _cfgmgr32 = cfg
+    return _cfgmgr32
+
+
 def _devnode_state(instance_id: str) -> str:
     """cfgmgr32 判定 devnode 状态。
 
@@ -502,12 +524,7 @@ def _devnode_state(instance_id: str) -> str:
     （0=online / 22=disabled / 其他原样报）；NORMAL 失败而 PHANTOM 定位成功 =
     幻影设备（不在总线上）= EC 级下线；两者都失败 = absent。
     """
-    cfg = ctypes.WinDLL("cfgmgr32")
-    cfg.CM_Locate_DevNodeW.argtypes = [ctypes.POINTER(wintypes.DWORD),
-                                       wintypes.LPCWSTR, wintypes.UINT]
-    cfg.CM_Get_DevNode_Status.argtypes = [ctypes.POINTER(wintypes.DWORD),
-                                          ctypes.POINTER(wintypes.DWORD),
-                                          wintypes.DWORD, wintypes.UINT]
+    cfg = _load_cfgmgr32()
     CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM = 0, 1
     devinst = wintypes.DWORD(0)
     if cfg.CM_Locate_DevNodeW(ctypes.byref(devinst), instance_id,
@@ -705,11 +722,14 @@ def _mqtt_parse_publish(flags: int, body: bytes) -> tuple[str, str]:
     return topic, body[pos:].decode("utf-8", "replace")
 
 
-def gcu_mqtt_command(payload: str, listen_secs: float = 8.0
+def gcu_mqtt_command(payload: str, listen_secs: float = 8.0,
+                     stop_keys: tuple[str, ...] = ()
                      ) -> tuple[str, list[tuple[str, str]]]:
     """连 GCU 控制通道：订阅状态回报 → 发布命令到 Setting/Control → 收 listen_secs 秒。
 
     返回 (状态, [(topic, payload), ...])。状态 "ok" 或错误描述。
+    stop_keys：任一回报 payload 含这些子串时立即结束收听——判据码已到手，等满
+    listen_secs 是白等（2026-11-13 实测每次浪费 ~7s）。
     仅依赖标准库 socket/struct 手写 MQTT 3.1.1 最小客户端。
     """
     events: list[tuple[str, str]] = []
@@ -748,7 +768,10 @@ def gcu_mqtt_command(payload: str, listen_secs: float = 8.0
                 break
             ptype, flags, body = p
             if ptype == 3:  # PUBLISH
-                events.append(_mqtt_parse_publish(flags, body))
+                item = _mqtt_parse_publish(flags, body)
+                events.append(item)
+                if any(k in item[1] for k in stop_keys):
+                    break
         return "ok", events
     finally:
         sock.close()
@@ -864,11 +887,23 @@ class _MEW(ctypes.Structure):
     ]
 
 
+_psapi = None
+
+
+def _load_psapi():
+    """psapi 惰性单例（同 _load_pdh/_load_kernel32 的模式）。"""
+    global _psapi
+    if _psapi is None:
+        psapi = ctypes.WinDLL("psapi")
+        psapi.EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        _psapi = psapi
+    return _psapi
+
+
 def _list_pids() -> list[int]:
     """psapi EnumProcesses 全量 pid。"""
-    psapi = ctypes.WinDLL("psapi")
-    psapi.EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD),
-                                    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    psapi = _load_psapi()
     arr = (wintypes.DWORD * 2048)()
     needed = wintypes.DWORD(0)
     if not psapi.EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(needed)):
@@ -879,10 +914,6 @@ def _list_pids() -> list[int]:
 def nv_modules_of(pid: int) -> set[str]:
     """pid 加载的 NVIDIA 用户态接口模块（nvapi/nvml/nvspcaps）；快照打不开返回空集。"""
     k = _load_kernel32()
-    for fn in ("Module32FirstW", "Module32NextW"):
-        f = getattr(k, fn)
-        f.restype = wintypes.BOOL
-        f.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     INVALID = ctypes.c_void_p(-1).value
     msnap = k.CreateToolhelp32Snapshot(0x8 | 0x10, pid)  # MODULE | MODULE32
     if not msnap or msnap == INVALID:
@@ -939,9 +970,13 @@ def kill_by_name(name: str) -> tuple[bool, str]:
     """taskkill /F /T /IM：按映像名强杀全部同名进程及各自的进程树。
 
     必须提权调用——否则对以管理员运行的软件（HwMonitor/GamePP 等）直接拒绝访问。
+    返回码 128 = 该名进程已不在：常见于父进程先被杀、子进程已随树退出（2026-11-13
+    实测 HwMonitor64 随 GamePP 树退出后按名再杀报此码），按已结束算成功，复查段会兜底验证。
     """
     r = subprocess.run(["taskkill", "/F", "/T", "/IM", name],
                        capture_output=True)
+    if r.returncode == 128:
+        return True, ""
     msg = (r.stderr or r.stdout or b"").decode("gbk", "replace").strip().replace("\n", " | ")
     return r.returncode == 0, msg
 
@@ -1034,7 +1069,7 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
         if relaunch_elevated_eco():
             print("已在提权的新窗口继续，本窗口退出。")
-            print(f"完整输出与日志见项目 logs/ 目录（{eco_log_path()[: -21]}…）")
+            print(f"完整输出与日志见项目 logs/ 目录（{os.path.dirname(eco_log_path())}）")
             return 0
         print("提权被取消，退出。")
         return 1
@@ -1070,7 +1105,6 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
     handled_pids: set[int] = set()
     handled_names: set[str] = set()
-    killed = False
     if candidates or drv_holders:
         if candidates:
             print_eco_rows(candidates, f"图形上下文持有（{len(candidates)} 个，按显存排序）")
@@ -1084,7 +1118,6 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
                      "  [2] 不关闭直接继续  [回车/其他] 取消")
         if choice == "1":
-            killed = True
             names = sorted({proc_name(r["image"]) for r in candidates} |
                            {name for _, name, _ in drv_holders})
             print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
@@ -1132,33 +1165,28 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
     else:
         print("  ✓ 独显已无任何存活持有（图形上下文 + 驱动层双口径）")
 
-    # ③b 静置：清场后 GCU 的驱动层判据回落比 WDDM 计数器滞后——复查干净≠判据干净
-    #     （2026-11-11 实测：+2s 复查已干净，命令仍被判据码 1 拒绝；隔 ~10s 重发即成功）
-    if killed:
-        print("\n--- 静置 8s（等 GCU 驱动层判据回落）---")
-        time.sleep(8.0)
-
-    # ④ 发送官方同款切换命令（控制中心 UI 的同一条 MQTT 通道，GCUService 执行）
+    # ④ 发送官方同款切换命令（控制中心 UI 的同一条 MQTT 通道，GCUService 执行）。
+    #    判据在驱动层，回落比进程退出滞后——不静置抢跑（2026-11-13 实测：静置 8s 后首发
+    #    仍被判据码 1 拒绝，回落实际需 ~18s，静置形同虚设）；被拒不亏，等 10s 重发兜底，
+    #    最多 3 次覆盖回落时间浮动；stop_keys 让判据码一到就返回，不傻等 listen 满 8s。
     print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
-    status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0)
-    if status != "ok":
-        print(f"X GCU 控制通道不可用：{status}")
-        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
-        return 1
-    print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON）")
-    print_gcu_events(events)
-    rejected = gcu_rejected(events)
-    if rejected:
-        print("  ! 判据码 1：GCU 判「显卡使用中」拒绝——判据（驱动层）回落比进程退出滞后。")
-        print("    静置 10s 自动重发一次（免手动跑第二次）…")
-        time.sleep(10.0)
-        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0)
+    events: list[tuple[str, str]] = []
+    for attempt in range(1, 4):
+        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
+                                          stop_keys=("CheckDGpuStatusforIGpuOnlyOnSuccess",))
         if status != "ok":
             print(f"X GCU 控制通道不可用：{status}")
+            print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
             return 1
-        print("  ✓ 命令已重发")
+        print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
         print_gcu_events(events)
-        rejected = gcu_rejected(events)
+        if not gcu_rejected(events):
+            break
+        if attempt < 3:
+            print("  ! 判据码 1：GCU 判「显卡使用中」拒绝——判据（驱动层）回落滞后，"
+                  "等 10s 重发…")
+            time.sleep(10.0)
+    rejected = gcu_rejected(events)
 
     res = None
     if rejected:
@@ -1206,7 +1234,9 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         print(f"\n当前模式不是核显省电态（{MODE_LABELS[st.mode]}），本命令只负责省电态 → 混合。")
         return 1
     print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
-    status, events = gcu_mqtt_command(GCU_ECO_OFF_CMD, listen_secs=8.0)
+    status, events = gcu_mqtt_command(
+        GCU_ECO_OFF_CMD, listen_secs=8.0,
+        stop_keys=("IGpuOnlyConnectionSwitch_Status", "CheckDGpuStatusforIGpuOnlyOnSuccess"))
     if status != "ok":
         print(f"X GCU 控制通道不可用：{status}")
         print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
