@@ -845,6 +845,51 @@ PROTECTED_PROCESSES = {
     "gcuservice.exe", "gcubridge.exe", "ccuwinui.exe",
 }
 
+# NVIDIA 自家组件（PROTECTED_PROCESSES 的 NV 子集）：GCU 接到切换指令后联动停止的
+# 对象（2026-11-16 嗅探实测：指令后 1s 内开始退出，nvcontainer 服务正常停止
+# exit code 0，非裸杀）。判据码 1 期间它们正在退场，退光后驱动层判据才回落——
+# 所以重发前等它们退场，不赌固定秒数（官方 UI 就是定时重发赌回落，要连发 4 次）。
+NV_COMPONENT_NAMES = {
+    "nvcontainer.exe", "nvdisplay.container.exe", "nvidia overlay.exe",
+    "nvidia share.exe", "nvidia web helper.exe",
+}
+
+
+def nv_components_alive() -> list[str]:
+    """NV 自家组件存活名单（去重进程名，按名排序）。tasklist 查不动返回空。"""
+    try:
+        out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                             capture_output=True, timeout=8
+                             ).stdout.decode("gbk", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return []  # 查不动当退光——不 block 重发，后面还有循环兜底
+    alive = set()
+    for line in out.splitlines():
+        name = line.split('","', 1)[0].strip('"').lower()
+        if name in NV_COMPONENT_NAMES:
+            alive.add(name)
+    return sorted(alive)
+
+
+def wait_nv_components_gone(timeout_sec: float = 40.0) -> bool:
+    """等 NV 自家组件退场：全退返回 True，超时返回 False。
+
+    每 2s 快照一次，每 5s 打一行进度（在场还剩几个）。
+    """
+    deadline = time.monotonic() + timeout_sec
+    next_note = time.monotonic() + 5.0
+    while True:
+        left = nv_components_alive()
+        if not left:
+            return True
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        if now >= next_note:
+            print(f"    … NV 组件仍在场 {len(left)} 个（{'、'.join(left)}）")
+            next_note = now + 5.0
+        time.sleep(2.0)
+
 
 def classify_pid(pid: int) -> tuple[bool, bool]:
     """进程状态分类，返回 (存活, 受保护)。
@@ -1166,9 +1211,10 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         print("  ✓ 独显已无任何存活持有（图形上下文 + 驱动层双口径）")
 
     # ④ 发送官方同款切换命令（控制中心 UI 的同一条 MQTT 通道，GCUService 执行）。
-    #    判据在驱动层，回落比进程退出滞后——不静置抢跑（2026-11-13 实测：静置 8s 后首发
-    #    仍被判据码 1 拒绝，回落实际需 ~18s，静置形同虚设）；被拒不亏，等 10s 重发兜底，
-    #    最多 3 次覆盖回落时间浮动；stop_keys 让判据码一到就返回，不傻等 listen 满 8s。
+    #    判据码 1 不是拒绝而是中间态（2026-11-16 嗅探实测）：GCU 接指令后 1s 内联动
+    #    停止 NV 自家组件，退场期间驱动层判据仍见其持有；等 NV 组件退光 + 5s 回落
+    #    余量再重发，基本必中（官方 UI 是定时盲重发，连发 4 次耗 25s）。保留 3 次
+    #    循环兜底；stop_keys 让判据码一到就返回，不傻等 listen 满 8s。
     print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
     events: list[tuple[str, str]] = []
     for attempt in range(1, 4):
@@ -1183,14 +1229,18 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
         if not gcu_rejected(events):
             break
         if attempt < 3:
-            print("  ! 判据码 1：GCU 判「显卡使用中」拒绝——判据（驱动层）回落滞后，"
-                  "等 10s 重发…")
-            time.sleep(10.0)
+            print("  ! 判据码 1：GCU 正联动停止 NV 自家组件（预期中间态），"
+                  "等它们退场后再重发…")
+            if wait_nv_components_gone():
+                print("    NV 组件已退光，再留 5s 判据回落余量")
+                time.sleep(5.0)
+            else:
+                print("    40s 内 NV 组件未退光，照常重发兜底")
     rejected = gcu_rejected(events)
 
     res = None
     if rejected:
-        print("\nX 两次命令均被判据码 1 拒绝（判「显卡使用中」），不再空等。当前状态：")
+        print("\nX 三次命令均被判据码 1（判「显卡使用中」），不再空等。当前状态：")
         res = read_display_mode_state()
         print_mode_state(res)
     else:
