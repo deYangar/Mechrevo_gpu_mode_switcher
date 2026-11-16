@@ -530,15 +530,16 @@ class App:
         if m.get("nv_only"):
             mods = ", ".join(sorted(m["nv_mods"]))
             self.detail.config(
-                text=f"驱动层口径：{m['image']}  (pid {m['pid']})  加载 {mods}"
-                     f"  ｜  无图形上下文，WDDM 表不可见（传感器轮询类软件在此现形）",
+                text=f"驱动层口径：{m['image']}  (pid {m['pid']})\n"
+                     f"加载 {mods}  ｜  无图形上下文，WDDM 表不可见（传感器轮询类软件在此现形）",
                 foreground="#222")
             return
         active = {k: v for k, v in m["engines"].items() if v > 0.05}
         engines = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
         prot = "  ｜ 系统/服务组件（保护名单，不建议结束）" if is_protected(m["image"]) else ""
-        self.detail.config(text=f"{m['image']}  (pid {m['pid']})  显存 {m['local_mb']:.2f} MB"
-                                 f"  ｜  {engines}{prot}", foreground="#222")
+        self.detail.config(text=f"{m['image']}  (pid {m['pid']})\n"
+                                 f"显存 {m['local_mb']:.2f} MB  ｜  {engines}{prot}",
+                           foreground="#222")
 
     def _popup_menu(self, ev):
         iid = self.tree.identify_row(ev.y)
