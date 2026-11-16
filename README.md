@@ -38,7 +38,10 @@ pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefil
 - 底部徽章 = `--status` 三态凭证实时显示（PnP problem / DXGI / GCU 注册表）
 - 「核显省电 / 恢复混合」按钮 = 内嵌控制台运行完整切换编排，问答弹框应答，
   输出同步留档 `logs/eco_*.txt`；「导出 JSON」= `--json` 同构快照
-- 「驱动层持有者」页 = NVAPI/NVML 模块口径（补 WDDM 盲区，传感器轮询类软件在此现形）
+- 驱动层持有者（NVAPI/NVML 模块口径，补 WDDM 盲区）**合并进主表格**：后台线程
+  每 3s 自动扫，不手动刷新——WDDM 表里已有的进程在其行「NV 模块」列标注；
+  WDDM 抓不到的（HWiNFO 等无图形上下文的传感器轮询软件）追加紫底行
+  「驱动层（无上下文）」，右键菜单照常可用
 
 ## 原理
 

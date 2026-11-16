@@ -5,7 +5,8 @@
 - 「核显省电 / 恢复混合」= 内嵌控制台原样运行 cmd_eco_on / cmd_eco_off：
   print 重定向进日志面板（双写 logs/eco_*.txt 留档），ask() 的 input() 弹问答框应答，
   编排代码零改动——CLI 双向真测过的路径就是 GUI 跑的路径
-- 驱动层持有者页 = nv_module_holders（NVAPI/NVML 口径，补 WDDM 盲区）
+- 驱动层持有者（NVAPI/NVML 口径，补 WDDM 盲区）合并进主表格：后台线程自动扫，
+  WDDM 已有的行补「NV 模块」列，WDDM 抓不到的（HWiNFO 等无图形上下文者）追加行
 - 打包：dgpu_detective.spec（onefile + windowed + uac_admin），build_exe.ps1 一键构建
 """
 
@@ -138,16 +139,21 @@ class _LogSink:
 
 class App:
     POLL_MS = 150
+    NV_SCAN_S = 3.0  # 驱动层扫描节奏：全系统模块快照单轮数百 ms，独立线程跑不拖采样
 
     def __init__(self, root: tk.Tk, adapters: list):
         self.root = root
         root.title("独显占用侦探")
         root.geometry("1040x700")
         root.minsize(860, 560)
-        self._autorun_done = False  # DGPU_TEST_AUTORUN 钩子只触发一次
+        self._autorun_done = False    # DGPU_TEST_AUTORUN 钩子只触发一次
+        self._autorun_dumped = False  # DGPU_TEST_DUMP 钩子只写一次
 
         # ---- 跨线程状态（工作线程与主线程各管各的写方向，GIL 下安全）----
         self.q = queue.Queue()      # 工作线程 -> 主线程：snap/err/ask/ecodone/nvtab
+        self.nv_rows = []           # 最近一轮驱动层扫描 [(pid, name, mods)]，主线程渲染用
+        self._nv_req = True         # 立即扫一轮标志（启动即扫；手动刷新/切换结束置位）
+        self._nv_due = 0.0          # 下次自动扫描的时刻（monotonic）
         self.log_q = queue.Queue()  # 日志流（raw str）-> 主线程 Text
         self.stop_evt = threading.Event()
         self.adapters = adapters
@@ -173,6 +179,8 @@ class App:
 
         self.sampler = threading.Thread(target=self._sampler_loop, daemon=True)
         self.sampler.start()
+        self.nv_scanner = threading.Thread(target=self._nv_loop, daemon=True)
+        self.nv_scanner.start()
         self.root.after(self.POLL_MS, self._poll)
 
     # ------------------------------------------------------------- UI 构建
@@ -215,22 +223,25 @@ class App:
         pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
 
         tree_frame = ttk.Frame(pw)
-        cols = ("gpu", "pid", "name", "local", "nonlocal", "committed", "engines")
+        cols = ("gpu", "pid", "name", "local", "nonlocal", "committed", "engines",
+                "nvmods")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                  selectmode="browse")
         for cid, text, w, anchor in (
-                ("gpu", "显卡", 140, "w"), ("pid", "PID", 60, "e"),
-                ("name", "进程", 150, "w"), ("local", "显存(MB)", 85, "e"),
-                ("nonlocal", "共享(MB)", 85, "e"), ("committed", "提交(MB)", 85, "e"),
-                ("engines", "引擎活动", 250, "w")):
+                ("gpu", "显卡", 120, "w"), ("pid", "PID", 60, "e"),
+                ("name", "进程", 140, "w"), ("local", "显存(MB)", 80, "e"),
+                ("nonlocal", "共享(MB)", 80, "e"), ("committed", "提交(MB)", 80, "e"),
+                ("engines", "引擎活动", 210, "w"), ("nvmods", "NV 模块", 160, "w")):
             self.tree.heading(cid, text=text)
-            self.tree.column(cid, width=w, anchor=anchor, stretch=(cid in ("name", "engines")))
+            self.tree.column(cid, width=w, anchor=anchor,
+                             stretch=(cid in ("name", "engines", "nvmods")))
         ysb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
         self.tree.tag_configure("new", background="#fff3b2")     # 新持有高亮
         self.tree.tag_configure("igpu", background="#eef4fd")    # 核显行
+        self.tree.tag_configure("nvdrv", background="#f4eefb")   # 驱动层口径行（WDDM 不可见）
         self.tree.tag_configure("prot", foreground="#8a2f2f")    # 系统/服务组件
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
@@ -241,12 +252,7 @@ class App:
         self.detail.pack(side="bottom", fill="x")
 
         pw.add(tree_frame, weight=3)
-
-        nb = ttk.Notebook(pw)
-        self.nb = nb
-        self._build_log_tab(nb)
-        self._build_nv_tab(nb)
-        pw.add(nb, weight=1)
+        self._build_log_pane(pw)
 
         # 底部状态栏
         sb = ttk.Frame(self.root, padding=(10, 2, 10, 6))
@@ -271,9 +277,9 @@ class App:
         self.menu.add_command(label="复制进程路径", command=self._copy_path)
         self.menu.add_command(label="打开文件位置", command=self._open_location)
 
-    def _build_log_tab(self, nb):
-        frame = ttk.Frame(nb, padding=4)
-        nb.add(frame, text=" 切换日志（内嵌控制台） ")
+    def _build_log_pane(self, pw):
+        frame = ttk.Frame(pw, padding=4)
+        pw.add(frame, weight=1)
         topbar = ttk.Frame(frame)
         topbar.pack(side="top", fill="x")
         ttk.Button(topbar, text="清空", width=6,
@@ -294,33 +300,6 @@ class App:
         self.log_text.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
         xsb.grid(row=1, column=0, sticky="ew")
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
-
-    def _build_nv_tab(self, nb):
-        frame = ttk.Frame(nb, padding=4)
-        nb.add(frame, text=" 驱动层持有者（NVAPI/NVML 口径） ")
-        topbar = ttk.Frame(frame)
-        topbar.pack(side="top", fill="x")
-        ttk.Button(topbar, text="刷新", width=6,
-                   command=self._refresh_nv_tab).pack(side="left")
-        self.nv_note = ttk.Label(topbar, text="传感器轮询类软件（HWiNFO 等）不建图形上下文，"
-                                              "WDDM 表抓不到；此口径直查 NV 模块加载者（GCU 判据口径）。"
-                                              "需管理员可见系统/提权进程。", foreground="#666")
-        self.nv_note.pack(side="left", padx=6)
-        body = ttk.Frame(frame)
-        body.pack(side="top", fill="both", expand=True)
-        cols = ("pid", "name", "mods", "mark")
-        self.nv_tree = ttk.Treeview(body, columns=cols, show="headings")
-        for cid, text, w in (("pid", "PID", 70), ("name", "进程", 160),
-                             ("mods", "NV 模块", 220), ("mark", "标记", 240)):
-            self.nv_tree.heading(cid, text=text)
-            self.nv_tree.column(cid, width=w, anchor="w",
-                                stretch=(cid in ("name", "mods", "mark")))
-        ysb = ttk.Scrollbar(body, orient="vertical", command=self.nv_tree.yview)
-        self.nv_tree.configure(yscrollcommand=ysb.set)
-        self.nv_tree.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
 
@@ -394,36 +373,18 @@ class App:
         keys_now = set()
         rows_total = 0
         new_count = 0
-        sel = self.tree.selection()
-        sel_iid = sel[0] if sel else None
-
-        self.tree.delete(*self.tree.get_children())
-        self.rowmeta.clear()
         for gpu in data:
-            short = short_gpu(gpu["name"])
             for r in gpu["processes"]:
                 rows_total += 1
-                iid = f"{gpu['luid']}:{r['pid']}"
-                keys_now.add((gpu["luid"], r["pid"]))
-                if self.prev_keys and (gpu["luid"], r["pid"]) not in self.prev_keys:
-                    self.new_marks[iid] = 4  # 高亮 4 轮后消退
+                key = (gpu["luid"], r["pid"])
+                keys_now.add(key)
+                if self.prev_keys and key not in self.prev_keys:
+                    self.new_marks[f"{gpu['luid']}:{r['pid']}"] = 4  # 高亮 4 轮后消退
                     new_count += 1
-                tags = []
-                if iid in self.new_marks:
-                    tags.append("new")
-                if not gpu["discrete"]:
-                    tags.append("igpu")
-                name = r["image"].rsplit("\\", 1)[-1]
-                if is_protected(r["image"]):
-                    tags.append("prot")
-                active = {k: v for k, v in r["engines"].items() if v > 0.05}
-                engstr = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
-                self.tree.insert("", "end", iid=iid, tags=tags, values=(
-                    short, r["pid"], name, f"{r['local_mb']:.2f}",
-                    f"{r['nonlocal_mb']:.2f}", f"{r['committed_mb']:.2f}", engstr))
-                self.rowmeta[iid] = dict(r, gpu=gpu["name"], discrete=gpu["discrete"])
+        self.prev_keys = keys_now
+        self._render_table()
 
-        # 高亮衰减
+        # 高亮衰减（按采样轮次，不受 nv 重画加速）
         for iid in list(self.new_marks):
             self.new_marks[iid] -= 1
             if self.new_marks[iid] <= 0 or not self.tree.exists(iid):
@@ -431,9 +392,6 @@ class App:
                 if self.tree.exists(iid):
                     left = [t for t in self.tree.item(iid, "tags") if t != "new"]
                     self.tree.item(iid, tags=left)
-        self.prev_keys = keys_now
-        if sel_iid and self.tree.exists(sel_iid):
-            self.tree.selection_set(sel_iid)
 
         # GPU 概要条（适配器消失时撤 chip：切核显省电后独显从 DXGI 层消失）
         seen_luids = set()
@@ -455,18 +413,77 @@ class App:
                 del self.chips[luid]
 
         self._apply_status(st)
+        nv_only = self._nv_only_count()
+        nv_extra = f"｜ 驱动层 {nv_only}" if nv_only else ""
         extra = f"｜ 新持有 {new_count}" if new_count else ""
         self.refresh_label.config(
-            text=f"{time.strftime('%H:%M:%S')} · {rows_total} 持有{extra}")
+            text=f"{time.strftime('%H:%M:%S')} · {rows_total} 持有{extra}{nv_extra}")
 
-        # 后台自测钩子：首帧数据就绪后自动选中首行 + 扫驱动层页（只读操作）
+        # 后台自测钩子：首帧数据就绪后自动选中首行（只读操作）
         if not self._autorun_done and os.environ.get("DGPU_TEST_AUTORUN") == "1":
             self._autorun_done = True
             kids = self.tree.get_children()
             if kids:
                 self.tree.selection_set(kids[0])
                 self.tree.focus(kids[0])
-            self._refresh_nv_tab()
+
+    def _nv_only_count(self) -> int:
+        """驱动层独有（WDDM 表抓不到）的持有者数。"""
+        wdm = {r["pid"] for gpu in (self.last_data or []) for r in gpu["processes"]}
+        return sum(1 for pid, _, _ in self.nv_rows if pid not in wdm)
+
+    def _render_table(self):
+        """按 last_data + nv_rows 重画主表格：WDDM 行 + 驱动层合并渲染。"""
+        data = self.last_data or []
+        sel = self.tree.selection()
+        sel_iid = sel[0] if sel else None
+
+        self.tree.delete(*self.tree.get_children())
+        self.rowmeta.clear()
+        nv_map = {pid: mods for pid, _name, mods in self.nv_rows}
+        wdm_pids = set()
+        for gpu in data:
+            short = short_gpu(gpu["name"])
+            for r in gpu["processes"]:
+                iid = f"{gpu['luid']}:{r['pid']}"
+                wdm_pids.add(r["pid"])
+                tags = []
+                if iid in self.new_marks:
+                    tags.append("new")
+                if not gpu["discrete"]:
+                    tags.append("igpu")
+                name = r["image"].rsplit("\\", 1)[-1]
+                if is_protected(r["image"]):
+                    tags.append("prot")
+                active = {k: v for k, v in r["engines"].items() if v > 0.05}
+                engstr = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
+                mods = nv_map.get(r["pid"])
+                mods_str = ", ".join(sorted(mods)) if mods else ""
+                self.tree.insert("", "end", iid=iid, tags=tags, values=(
+                    short, r["pid"], name, f"{r['local_mb']:.2f}",
+                    f"{r['nonlocal_mb']:.2f}", f"{r['committed_mb']:.2f}", engstr,
+                    mods_str))
+                self.rowmeta[iid] = dict(r, gpu=gpu["name"], discrete=gpu["discrete"])
+
+        # 驱动层独有行：WDDM 表抓不到的 NVAPI/NVML 持有者（HWiNFO 等无图形上下文者）
+        for pid, name, mods in sorted(self.nv_rows):
+            if pid in wdm_pids:
+                continue
+            iid = f"nv:{pid}"
+            tags = ["nvdrv"]
+            if is_protected(name):
+                tags.append("prot")
+            self.tree.insert("", "end", iid=iid, tags=tags, values=(
+                "驱动层（无上下文）", pid, name, "", "", "", "",
+                ", ".join(sorted(mods))))
+            self.rowmeta[iid] = {
+                "pid": pid, "image": name, "engines": {},
+                "local_mb": 0.0, "nonlocal_mb": 0.0, "committed_mb": 0.0,
+                "gpu": "驱动层（NVAPI/NVML 口径）", "discrete": True,
+                "nv_only": True, "nv_mods": mods,
+            }
+        if sel_iid and self.tree.exists(sel_iid):
+            self.tree.selection_set(sel_iid)
 
     def _chip(self, luid, name, discrete):
         if luid not in self.chips:
@@ -504,6 +521,13 @@ class App:
             return
         m = self.rowmeta.get(sel[0])
         if not m:
+            return
+        if m.get("nv_only"):
+            mods = ", ".join(sorted(m["nv_mods"]))
+            self.detail.config(
+                text=f"驱动层口径：{m['image']}  (pid {m['pid']})  加载 {mods}"
+                     f"  ｜  无图形上下文，WDDM 表不可见（传感器轮询类软件在此现形）",
+                foreground="#222")
             return
         active = {k: v for k, v in m["engines"].items() if v > 0.05}
         engines = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
@@ -569,6 +593,7 @@ class App:
     def _on_auto_toggle(self):
         self._auto = self.auto_var.get()
         self._manual_req = True
+        self._nv_req = True
 
     def _on_interval(self):
         try:
@@ -584,6 +609,7 @@ class App:
 
     def _refresh_now(self):
         self._manual_req = True
+        self._nv_req = True
 
     def _export_json(self):
         if not self.last_data:
@@ -612,14 +638,10 @@ class App:
                 "exe 版自带 UAC 提权；源码运行请用管理员终端启动。")
             return
         self.eco_running = True
-        self._paused = True  # PDH 句柄不与切换 worker 并发
+        self._paused = True  # PDH 句柄不与切换 worker 并发；nv 扫描同停
         self.eco_on_btn.config(state="disabled")
         self.eco_off_btn.config(state="disabled")
-        self.log_notebook_focus()
         threading.Thread(target=self._eco_worker, args=(target,), daemon=True).start()
-
-    def log_notebook_focus(self):
-        self.nb.select(0)  # 切到「切换日志」页
 
     def _eco_worker(self, target: str):
         co_init()
@@ -658,6 +680,7 @@ class App:
         self.eco_running = False
         self._paused = False
         self._manual_req = True
+        self._nv_req = True
         self.eco_on_btn.config(state="normal")
         self.eco_off_btn.config(state="normal")
         self.log_q.put(f"\n（切换编排结束，返回码 {rc}）\n")
@@ -688,24 +711,45 @@ class App:
         win.grab_set()
         win.protocol("WM_DELETE_WINDOW", lambda: answer(""))
 
-    # ------------------------------------------------------------- 驱动层页
+    # ------------------------------------------------------------- 驱动层扫描
 
-    def _refresh_nv_tab(self):
-        def work():
-            co_init()
-            try:
-                rows = eng.nv_module_holders(set())  # 不排除，保护名单打标记展示
-                self.q.put(("nvtab", rows))
-            except Exception as e:
-                self.q.put(("err", f"驱动层扫描失败: {e!r}"))
-        threading.Thread(target=work, daemon=True).start()
+    def _nv_loop(self):
+        """后台驱动层扫描：自动模式每 NV_SCAN_S 一轮；_nv_req 立即触发（启动、
+        手动刷新、切换结束）；_paused（切换期间）全停。全系统模块快照单轮数百 ms，
+        独立线程跑，不占采样节奏、不卡 UI。"""
+        while not self.stop_evt.is_set():
+            if not self._paused and (
+                    self._nv_req or (self._auto and time.monotonic() >= self._nv_due)):
+                self._nv_req = False
+                self._nv_due = time.monotonic() + self.NV_SCAN_S
+                try:
+                    # 不排除保护名单——保护名单行照常显示、标红不杀
+                    self.q.put(("nvtab", eng.nv_module_holders(set())))
+                except Exception as e:
+                    self.q.put(("err", f"驱动层扫描失败: {e!r}"))
+            self.stop_evt.wait(0.3)
 
     def _apply_nvtab(self, rows):
-        self.nv_tree.delete(*self.nv_tree.get_children())
-        for pid, name, mods in rows:
-            mark = "系统/服务组件（保护名单）" if name.lower() in eng.PROTECTED_PROCESSES else ""
-            self.nv_tree.insert("", "end", values=(
-                pid, name, ", ".join(sorted(mods)), mark))
+        self.nv_rows = rows
+        if self.last_data:
+            self._render_table()  # 自动刷新关闭时也立即并入表格
+        # 后台自测钩子（DGPU_TEST_DUMP=路径）：nv 首轮到达后再等一轮采样合并，
+        # dump 表格实渲染内容（PrintWindow 抓不到屏幕外 Treeview 内容，像素验证不了）
+        if not self._autorun_dumped and os.environ.get("DGPU_TEST_DUMP"):
+            self._autorun_dumped = True
+            self.root.after(1600, self._dump_tree)
+
+    def _dump_tree(self):
+        path = os.environ["DGPU_TEST_DUMP"]
+        cols = [self.tree.heading(c)["text"] for c in self.tree["columns"]]
+        lines = ["\t".join(cols)]
+        for iid in self.tree.get_children():
+            tags = ",".join(self.tree.item(iid, "tags"))
+            vals = "\t".join(str(v) for v in self.tree.item(iid, "values"))
+            lines.append(f"[{tags}]\t{vals}")
+        lines.append(f"nv_rows: {self.nv_rows!r}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
     # ------------------------------------------------------------- 日志面板
 
