@@ -1026,12 +1026,12 @@ def kill_by_name(name: str) -> tuple[bool, str]:
     return r.returncode == 0, msg
 
 
-def relaunch_elevated_eco() -> bool:
+def relaunch_elevated_eco(extra_args: str = "") -> bool:
     """UAC 提权重启 --eco 自身；强杀以管理员运行的占用软件需要管理员。"""
     if getattr(sys, "frozen", False):
-        params = "--eco"  # PyInstaller exe：重启 exe 自身，不能传 .py 路径
+        params = "--eco" + extra_args  # PyInstaller exe：重启 exe 自身，不能传 .py 路径
     else:
-        params = f'"{os.path.abspath(__file__)}" --eco'
+        params = f'"{os.path.abspath(__file__)}" --eco{extra_args}'
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
     return rc > 32
 
@@ -1093,8 +1093,12 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
               f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{note}")
 
 
-def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
-    """切核显省电（真切换）：检测独显持有 → 清场 → 发 GCU 同款 MQTT 命令 → 凭证验证。"""
+def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
+               auto_yes: bool = False) -> int:
+    """切核显省电（真切换）：检测独显持有 → 清场 → 发 GCU 同款 MQTT 命令 → 凭证验证。
+
+    auto_yes：清场确认自动应答 1（无人值守跑法；GUI 不传，走问答框）。
+    """
     st = read_display_mode_state()
     print("=== 核显省电切换编排（检测 → 清场 → 发送官方同款命令 → 凭证验证）===")
     print_mode_state(st)
@@ -1112,7 +1116,7 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
 
     if not is_admin():
         print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
-        if relaunch_elevated_eco():
+        if relaunch_elevated_eco(" --yes" if auto_yes else ""):
             print("已在提权的新窗口继续，本窗口退出。")
             print(f"完整输出与日志见项目 logs/ 目录（{os.path.dirname(eco_log_path())}）")
             return 0
@@ -1160,8 +1164,10 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
             for pid, name, mods in drv_holders:
                 print(f"  pid {pid:<7} {name:<{name_w}}  [{', '.join(sorted(mods))}]")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或系统组件）")
-        choice = ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
-                     "  [2] 不关闭直接继续  [回车/其他] 取消")
+        choice = ("1（--yes 自动应答）" if auto_yes else
+                  ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
+                      "  [2] 不关闭直接继续  [回车/其他] 取消"))
+        choice = "1" if auto_yes else choice
         if choice == "1":
             names = sorted({proc_name(r["image"]) for r in candidates} |
                            {name for _, name, _ in drv_holders})
@@ -1232,8 +1238,10 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter]) -> int:
             print("  ! 判据码 1：GCU 正联动停止 NV 自家组件（预期中间态），"
                   "等它们退场后再重发…")
             if wait_nv_components_gone():
-                print("    NV 组件已退光，再留 5s 判据回落余量")
-                time.sleep(5.0)
+                print("    NV 组件已退光，再留 15s 判据回落余量")
+                # 2026-11-16 两次实测：NV 退光后驱动层判据回落还需 10-15s+；
+                # 5s 余量实测第 2 发仍被拒（退光后 ~6s 发），15s 才稳落回落完成窗
+                time.sleep(15.0)
             else:
                 print("    40s 内 NV 组件未退光，照常重发兜底")
     rejected = gcu_rejected(events)
@@ -1323,6 +1331,8 @@ def main() -> int:
     ap.add_argument("--status", action="store_true",
                     help="报告当前显示模式与凭证（PnP problem code / DXGI / GCU 注册表）")
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")
+    ap.add_argument("--yes", action="store_true",
+                    help="eco on 清场确认自动应答 1（无人值守；会直接强杀候选进程）")
     args = ap.parse_args()
 
     try:
@@ -1353,7 +1363,7 @@ def main() -> int:
         sys.stdout = log  # 双写：终端 + 日志
         try:
             print(f"（本次运行日志: {log_path}）")
-            return cmd_eco_on(counters, adapters_meta)
+            return cmd_eco_on(counters, adapters_meta, auto_yes=args.yes)
         finally:
             counters.close()
             sys.stdout = log._out

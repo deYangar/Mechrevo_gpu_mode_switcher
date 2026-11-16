@@ -2,9 +2,11 @@
 """GCU 切换动作全程嗅探：MQTT 总线 + NV 组件进程 + 显示模式，三路时间线。
 
 纯被动观测，不发任何切换指令（除了 MQTT 保活 PINGREQ）。
-用法: python tools/gcu_trace.py [时长秒，默认 120]
+用法: python tools/gcu_trace.py [时长秒，默认 120] [--no-mqtt]
+  --no-mqtt：跳过 MQTT 线——与 dgpu_detective --eco 同跑时必加（两者都用
+  UWPClient_4 席位，互踢会砍掉编排的判据码回报）；判据码时刻看编排自己的日志。
 输出: stdout + logs/gcu_trace_时间戳.txt；Ctrl+C 或到时停止后自动拉
-System 事件日志 7036（服务状态变化）补第四路时间线。
+System 事件日志 7036（服务状态变化）补第四路时间线（本机基本不记，仅兜底）。
 """
 import json
 import socket
@@ -200,17 +202,21 @@ def dump_service_events(trace: Trace, minutes: int = 10) -> None:
 
 
 def main() -> int:
-    duration = float(sys.argv[1]) if len(sys.argv) > 1 else 120.0
+    argv = [a for a in sys.argv[1:] if a != "--no-mqtt"]
+    no_mqtt = "--no-mqtt" in sys.argv[1:]
+    duration = float(argv[0]) if argv else 120.0
     logdir = Path(__file__).resolve().parents[1] / "logs"
     logdir.mkdir(exist_ok=True)
     path = logdir / f"gcu_trace_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     trace = Trace(path)
     trace.log(f"===== GCU 切换动作嗅探 {datetime.now():%Y-%m-%d %H:%M:%S} "
-              f"（时长 {duration:.0f}s，被动观测）=====")
+              f"（时长 {duration:.0f}s，被动观测{'+ 无 MQTT' if no_mqtt else ''}）=====")
     trace.log("现在去控制中心点「核显省电」，全程会被记录。Ctrl+C 提前结束。\n")
     stop = threading.Event()
+    probes = (nv_snapshot, mode_snapshot) if no_mqtt else \
+             (mqtt_sniff, nv_snapshot, mode_snapshot)
     threads = [threading.Thread(target=fn, args=(trace, stop), daemon=True)
-               for fn in (mqtt_sniff, nv_snapshot, mode_snapshot)]
+               for fn in probes]
     for t in threads:
         t.start()
     try:
