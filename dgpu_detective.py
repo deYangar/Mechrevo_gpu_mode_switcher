@@ -1094,10 +1094,12 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
 
 
 def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
-               auto_yes: bool = False) -> int:
+               auto_yes: bool = False, keep_names: set[str] | None = None) -> int:
     """切核显省电（真切换）：检测独显持有 → 清场 → 发 GCU 同款 MQTT 命令 → 凭证验证。
 
     auto_yes：清场确认自动应答 1（无人值守跑法；GUI 不传，走问答框）。
+    keep_names：清场豁免名单（小写进程名）；其余候选照杀、豁免者保留在场——
+    受控实验用（如只留 steam.exe/Everything.exe，实测它们是否挡 GCU 判据）。
     """
     st = read_display_mode_state()
     print("=== 核显省电切换编排（检测 → 清场 → 发送官方同款命令 → 凭证验证）===")
@@ -1116,7 +1118,9 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
 
     if not is_admin():
         print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
-        if relaunch_elevated_eco(" --yes" if auto_yes else ""):
+        extra = ((" --keep " + ",".join(sorted(keep_names))) if keep_names else "") + \
+                (" --yes" if auto_yes else "")
+        if relaunch_elevated_eco(extra):
             print("已在提权的新窗口继续，本窗口退出。")
             print(f"完整输出与日志见项目 logs/ 目录（{os.path.dirname(eco_log_path())}）")
             return 0
@@ -1144,13 +1148,16 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
         print(f"（已过滤陈旧计数器实例 {stale} 个：进程已退出）")
 
     # ①b 驱动层口径：NVAPI/NVML 模块持有者。传感器轮询类软件（HWiNFO 等）不创建
-    #     WDDM 图形上下文，① 抓不到它们，但 GCU 判据看得到（2026-11-11 实测教训）
+    #     WDDM 图形上下文，① 抓不到它们，但 GCU 判据看得到（2026-11-11 实测教训）。
+    #     区分两类：持续轮询类（NVML/NVAPI 反复查询）实测挡判据；仅加载 nvapi64
+    #     不轮询类（Steam/Everything）2026-11-16 --keep 实测不挡判据、切换 2 发即过
     wddm_pids = {r["pid"] for r in candidates} | {r["pid"] for r in skipped}
     drv_holders = [(pid, name, mods) for pid, name, mods in
                    nv_module_holders(PROTECTED_PROCESSES)
                    if pid not in wddm_pids]
 
     # ② 分类提示 + 选择；关闭 = 按进程名强杀全部同名实例（含子进程树）
+    keep = {n.lower() for n in keep_names} if keep_names else set()
     candidates.sort(key=lambda r: (-r["local_mb"], -max(r["engines"].values(), default=0.0)))
     handled_pids: set[int] = set()
     handled_names: set[str] = set()
@@ -1159,22 +1166,28 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
             print_eco_rows(candidates, f"图形上下文持有（{len(candidates)} 个，按显存排序）")
         if drv_holders:
             print(f"\n--- 驱动层持有（{len(drv_holders)} 个，NVAPI/NVML 模块加载者："
-                  "不占图形上下文但挡切换判据）---")
+                  "不占图形上下文；轮询类实测挡判据，纯加载类实测不挡）---")
             name_w = max(len(n) for _, n, _ in drv_holders)
             for pid, name, mods in drv_holders:
-                print(f"  pid {pid:<7} {name:<{name_w}}  [{', '.join(sorted(mods))}]")
+                keep_mark = "（--keep 保留）" if name.lower() in keep else ""
+                print(f"  pid {pid:<7} {name:<{name_w}}  [{', '.join(sorted(mods))}]{keep_mark}")
         print_eco_rows(skipped, f"系统/服务组件（{len(skipped)} 个，跳过不动：杀了被拉回或系统组件）")
-        choice = ("1（--yes 自动应答）" if auto_yes else
+        choice = ("1（--yes 自动应答）" if (auto_yes or keep) else
                   ask("\n[1] 结束以上候选（含全部同名实例与子进程）并继续"
                       "  [2] 不关闭直接继续  [回车/其他] 取消"))
-        choice = "1" if auto_yes else choice
+        choice = "1" if (auto_yes or keep) else choice
         if choice == "1":
-            names = sorted({proc_name(r["image"]) for r in candidates} |
-                           {name for _, name, _ in drv_holders})
+            names = sorted(n for n in ({proc_name(r["image"]) for r in candidates} |
+                                       {name for _, name, _ in drv_holders})
+                           if n.lower() not in keep)
             print(f"\n--- 强制结束（taskkill /F /T /IM，共 {len(names)} 个进程名）---")
-            handled_pids = {r["pid"] for r in candidates} | {p for p, _, _ in drv_holders}
+            if keep:
+                print(f"（--keep 豁免未杀: {', '.join(sorted(keep))}）")
+            handled_pids = ({r["pid"] for r in candidates} | {p for p, _, _ in drv_holders}) - \
+                {r["pid"] for r in candidates if proc_name(r["image"]).lower() in keep} - \
+                {p for p, n, _ in drv_holders if n.lower() in keep}
             handled_names = ({proc_name(r["image"]).lower() for r in candidates} |
-                             {name.lower() for _, name, _ in drv_holders})
+                             {name.lower() for _, name, _ in drv_holders}) - keep
             for name in names:
                 ok, msg = kill_by_name(name)
                 tail = "" if ok else f" —— {msg[:120]}"
@@ -1197,19 +1210,25 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
                 continue
             if r["pid"] in handled_pids:
                 r["_note"] = "杀失败残留"
+            elif proc_name(r["image"]).lower() in keep:
+                r["_note"] = "--keep 实验保留对象"
             elif proc_name(r["image"]).lower() in handled_names:
                 r["_note"] = "被守护/自启拉回（新 pid），建议软件内退出或禁自启"
             remaining.append(r)
     drv_left = nv_module_holders(PROTECTED_PROCESSES)
     drv_notes = []
     for pid, name, mods in drv_left:
-        note = "（被守护/自启拉回），建议软件内退出或禁自启" \
-            if name.lower() in handled_names else ""
+        if name.lower() in keep:
+            note = "（--keep 实验保留对象）"
+        elif name.lower() in handled_names:
+            note = "（被守护/自启拉回），建议软件内退出或禁自启"
+        else:
+            note = ""
         drv_notes.append(f"  pid {pid:<7} {name}  [{', '.join(sorted(mods))}]{note}")
     if remaining or drv_notes:
         print_eco_rows(remaining, f"图形上下文剩余 {len(remaining)} 个（系统组件不阻碍切换）")
         if drv_notes:
-            print(f"驱动层剩余 {len(drv_notes)} 个（挡判据，切换前建议处理）：")
+            print(f"驱动层剩余 {len(drv_notes)} 个（轮询类挡判据建议处理；纯加载类实测不挡）：")
             for line in drv_notes:
                 print(line)
         print("（若下面切换失败，优先怀疑又有软件扑上来挡判据）")
@@ -1333,6 +1352,9 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")
     ap.add_argument("--yes", action="store_true",
                     help="eco on 清场确认自动应答 1（无人值守；会直接强杀候选进程）")
+    ap.add_argument("--keep", metavar="NAMES",
+                    help="eco on 清场豁免名单（逗号分隔进程名，不区分大小写）：其余候选照杀、"
+                         "豁免者保留在场，用于实测豁免对象是否挡切换判据（无人值守）")
     args = ap.parse_args()
 
     try:
@@ -1363,14 +1385,15 @@ def main() -> int:
         sys.stdout = log  # 双写：终端 + 日志
         try:
             print(f"（本次运行日志: {log_path}）")
-            return cmd_eco_on(counters, adapters_meta, auto_yes=args.yes)
+            keep = {s.strip() for s in args.keep.split(",") if s.strip()} if args.keep else set()
+            return cmd_eco_on(counters, adapters_meta, auto_yes=args.yes, keep_names=keep)
         finally:
             counters.close()
             sys.stdout = log._out
             log.close()
             # 跑完停窗：提权重启的新窗口在进程退出后即关闭，输出会丢；
             # 管道/重定向（无人值守）不停。
-            if sys.stdin and sys.stdin.isatty():
+            if sys.stdin and sys.stdin.isatty() and not (args.yes or args.keep):
                 try:
                     input("\n按回车关闭窗口…")
                 except EOFError:
