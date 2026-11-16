@@ -228,7 +228,7 @@ class App:
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                  selectmode="browse")
         for cid, text, w, anchor in (
-                ("gpu", "显卡", 120, "w"), ("pid", "PID", 60, "e"),
+                ("gpu", "显卡", 150, "w"), ("pid", "PID", 60, "e"),
                 ("name", "进程", 140, "w"), ("local", "显存(MB)", 80, "e"),
                 ("nonlocal", "共享(MB)", 80, "e"), ("committed", "提交(MB)", 80, "e"),
                 ("engines", "引擎活动", 210, "w"), ("nvmods", "NV 模块", 160, "w")):
@@ -237,6 +237,16 @@ class App:
                              stretch=(cid in ("name", "engines", "nvmods")))
         ysb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
+        # 明细条必须最先 pack（pack 按顺序分配空间）：先占满底部整行，
+        # 表格和滚动条再填剩余——若表格先 pack 且 expand，整行宽度被吃光，
+        # 明细只剩右侧零头，默认窗口宽度下被挤成一条竖缝、路径全截断
+        self.detail = ttk.Label(tree_frame, text="选中进程后这里显示完整路径与引擎明细",
+                                padding=(2, 3), wraplength=980, anchor="w",
+                                foreground="#444")
+        self.detail.pack(side="bottom", fill="x")
+        self.detail.bind(
+            "<Configure>",
+            lambda e: self.detail.configure(wraplength=max(200, e.width - 8)))
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
         self.tree.tag_configure("new", background="#fff3b2")     # 新持有高亮
@@ -245,11 +255,6 @@ class App:
         self.tree.tag_configure("prot", foreground="#8a2f2f")    # 系统/服务组件
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
-
-        self.detail = ttk.Label(tree_frame, text="选中进程后这里显示完整路径与引擎明细",
-                                padding=(2, 3), wraplength=980, anchor="w",
-                                foreground="#444")
-        self.detail.pack(side="bottom", fill="x")
 
         pw.add(tree_frame, weight=3)
         self._build_log_pane(pw)
@@ -748,6 +753,10 @@ class App:
             vals = "\t".join(str(v) for v in self.tree.item(iid, "values"))
             lines.append(f"[{tags}]\t{vals}")
         lines.append(f"nv_rows: {self.nv_rows!r}")
+        # 明细条几何：验证「先 pack 占满底行」没回退（被挤成竖缝时 w 只有百余像素）
+        lines.append(f"detail: w={self.detail.winfo_width()} "
+                     f"wraplength={self.detail.cget('wraplength')} "
+                     f"tree_w={self.tree.winfo_width()}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
