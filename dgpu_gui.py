@@ -333,24 +333,31 @@ class App:
         self.menu.add_command(label="打开文件位置", command=self._open_location)
 
     def _build_log_pane(self, pw):
-        frame = ttk.Frame(pw, padding=4)
+        frame = ctk.CTkFrame(pw, fg_color="transparent")
         pw.add(frame, weight=1)
-        topbar = ttk.Frame(frame)
-        topbar.pack(side="top", fill="x")
-        ttk.Button(topbar, text="清空", width=6,
-                   command=self._clear_log).pack(side="left")
-        ttk.Button(topbar, text="打开日志目录", width=12,
-                   command=self._open_log_dir).pack(side="left", padx=6)
-        ttk.Label(topbar, text="切换按钮在下方运行完整切换编排，"
-                               "输出同步留档 logs/（eco_/hybrid_/direct_）",
-                  foreground="#666").pack(side="left", padx=6)
+        topbar = ctk.CTkFrame(frame, fg_color="transparent")
+        topbar.pack(side="top", fill="x", padx=4, pady=(4, 0))
+        ctk.CTkButton(topbar, text="清空", width=64, height=28,
+                      command=self._clear_log).pack(side="left")
+        ctk.CTkButton(topbar, text="打开日志目录", width=110, height=28,
+                      command=self._open_log_dir).pack(side="left", padx=6)
+        ctk.CTkLabel(topbar, text="切换按钮在下方运行完整切换编排，"
+                                  "输出同步留档 logs/（eco_/hybrid_/direct_）",
+                     text_color="#8a94a3").pack(side="left", padx=6)
 
-        body = ttk.Frame(frame)
-        body.pack(side="top", fill="both", expand=True)
-        self.log_text = tk.Text(body, height=7, state="disabled", wrap="none",
-                                font=("Consolas", 9), background="#fbfbfb")
-        ysb = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
-        xsb = ttk.Scrollbar(body, orient="horizontal", command=self.log_text.xview)
+        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        # CTkTextbox：底色比组件底再深一档（编辑器感）；wrap=none 保长行横滚
+        #（横滚异常即回退 tk.Text 深色配色，方案 §三-7 预案）
+        self.log_text = ctk.CTkTextbox(body, height=7, wrap="none",
+                                       font=("Consolas", 9),
+                                       fg_color="#1e1e1e",
+                                       text_color="#dce4ee",
+                                       state="disabled")
+        ysb = ctk.CTkScrollbar(body, orientation="vertical",
+                               command=self.log_text.yview)
+        xsb = ctk.CTkScrollbar(body, orientation="horizontal",
+                               command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
