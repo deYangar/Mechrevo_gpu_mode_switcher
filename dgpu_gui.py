@@ -200,8 +200,8 @@ class App:
         self.root.rowconfigure(2, weight=1)
 
         # 顶部：GPU 概要条
-        self.gpu_bar = ttk.Frame(self.root, padding=(10, 6, 10, 2))
-        self.gpu_bar.grid(row=0, column=0, sticky="ew")
+        self.gpu_bar = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.gpu_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
 
         # 工具条
         bar = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -463,15 +463,15 @@ class App:
         for gpu in data:
             seen_luids.add(gpu["luid"])
             mem_l, eng_l = self._chip(gpu["luid"], gpu["name"], gpu["discrete"])
-            mem_l.config(text=f"显存 {gpu['adapter_dedicated_mb']:.2f} / "
-                              f"{gpu['card_vram_mb']:.2f} MB")
+            mem_l.configure(text=f"显存 {gpu['adapter_dedicated_mb']:.2f} / "
+                                 f"{gpu['card_vram_mb']:.2f} MB")
             best_k, best_v = "", 0.0
             for r in gpu["processes"]:
                 for k, v in r["engines"].items():
                     if v > best_v:
                         best_k, best_v = k, v
             peak = f"引擎峰值 {best_k} {best_v:.1f}%" if best_v > 0.05 else "引擎空闲"
-            eng_l.config(text=f"{len(gpu['processes'])} 持有 · {peak}")
+            eng_l.configure(text=f"{len(gpu['processes'])} 持有 · {peak}")
         for luid in list(self.chips):
             if luid not in seen_luids:
                 self.chips[luid][0].master.destroy()  # 撤掉已消失适配器的 LabelFrame
@@ -552,14 +552,18 @@ class App:
 
     def _chip(self, luid, name, discrete):
         if luid not in self.chips:
-            f = ttk.LabelFrame(self.gpu_bar,
-                               text=("独显 · " if discrete else "") + short_gpu(name),
-                               padding=(10, 4))
+            # 卡片：顶部标题行 + 显存/引擎两行；描边色区分独显（紫）/核显（蓝），
+            # 与模式徽章配色呼应
+            f = ctk.CTkFrame(self.gpu_bar, corner_radius=8, border_width=1,
+                             border_color=("#4a2a6b" if discrete else "#1d3a6b"))
             f.pack(side="left", fill="y", padx=(0, 8))
-            mem_l = ttk.Label(f, text="显存 …")
-            mem_l.grid(row=0, column=0, sticky="w")
-            eng_l = ttk.Label(f, text="…", foreground="#555")
-            eng_l.grid(row=1, column=0, sticky="w")
+            ctk.CTkLabel(f, text=("独显 · " if discrete else "") + short_gpu(name),
+                         text_color="#dce4ee").grid(
+                row=0, column=0, sticky="w", padx=10, pady=(6, 0))
+            mem_l = ctk.CTkLabel(f, text="显存 …", text_color="#8a94a3")
+            mem_l.grid(row=1, column=0, sticky="w", padx=10)
+            eng_l = ctk.CTkLabel(f, text="…", text_color="#8a94a3")
+            eng_l.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
             self.chips[luid] = (mem_l, eng_l)
         return self.chips[luid]
 
