@@ -18,6 +18,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -797,24 +798,54 @@ class App:
         win.transient(self.root)
         win.resizable(False, False)
         ttk.Label(win, text=prompt, wraplength=540, padding=14).pack()
-        entry = ttk.Entry(win, width=30)
-        entry.pack(padx=14, pady=(0, 8))
-        # 重启三选的 GUI 默认应答取安全侧（2=稍后自行重启）——一键回车不触发立即重启；
-        # 清场确认等其余问答仍默认 1
-        entry.insert(0, "2" if "立即重启" in prompt else "1")
-        entry.select_range(0, "end")
 
         def answer(v: str):
             bridge.ans_q.put(v)
             win.destroy()
 
-        btns = ttk.Frame(win)
-        btns.pack(pady=(0, 12))
-        ttk.Button(btns, text="确定", command=lambda: answer(entry.get())).pack(side="left", padx=6)
-        ttk.Button(btns, text="取消（=回车，取消切换）",
-                   command=lambda: answer("")).pack(side="left", padx=6)
-        entry.bind("<Return>", lambda e: answer(entry.get()))
-        entry.focus_set()
+        # 编号问答按钮化：解析 prompt 里的「[N] 描述」逐项一钮，[回车/其他] 描述=取消项；
+        # 解析不出编号（兜底问答）才退回输入框
+        opts = re.findall(r"\[(\d+)\]\s*([^\[\]]+)", prompt)
+        m_cancel = re.search(r"\[回车[^\]]*\]\s*([^\[\]]+)", prompt)
+        if opts:
+            body = ttk.Frame(win)
+            body.pack(padx=14, pady=(0, 12), fill="x")
+            focused = None
+
+            def hook_enter(b: tk.Button):
+                b.bind("<Return>", lambda e: b.invoke())
+
+            for num, desc in opts:
+                b = tk.Button(body, text=f"{num}｜{desc.strip()}", anchor="w",
+                              justify="left", wraplength=500, padx=10, pady=4,
+                              command=lambda n=num: answer(n))
+                b.pack(fill="x", pady=3)
+                # 回车默认落在预期项（旧口径：重启三选焦点在 2=稍后自行重启，
+                # 一键回车不触发立即重启；清场确认仍默认 1）
+                want = "2" if "立即重启" in prompt else "1"
+                if num == want:
+                    focused = b
+            cancel_desc = m_cancel.group(1).strip() if m_cancel else "取消切换"
+            cb = tk.Button(body, text=f"回车/其他｜{cancel_desc}", anchor="w",
+                           justify="left", wraplength=500, padx=10, pady=4,
+                           command=lambda: answer(""))
+            cb.pack(fill="x", pady=(3, 0))
+            if focused:
+                focused.focus_set()
+                hook_enter(focused)
+            win.bind("<Escape>", lambda e: answer(""))
+        else:
+            entry = ttk.Entry(win, width=30)
+            entry.pack(padx=14, pady=(0, 8))
+            ttk.Button(win, text="确定", command=lambda: answer(entry.get())).pack(pady=(0, 12))
+            entry.bind("<Return>", lambda e: answer(entry.get()))
+            entry.focus_set()
+        # 居中于主窗口（Toplevel 默认落屏幕左上角，切换问答该跟着主窗走）
+        win.update_idletasks()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"+{rx + max(0, (rw - ww) // 2)}+{ry + max(0, (rh - wh) // 3)}")
         win.grab_set()
         win.protocol("WM_DELETE_WINDOW", lambda: answer(""))
 
