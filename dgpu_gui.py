@@ -366,11 +366,18 @@ class App:
             command=lambda: self.run_switch("on"))
         self.eco_on_btn.pack(side="left")
 
-        # 中央：上持有者表格 / 下 Notebook，可拖分界
-        self.pw = ttk.PanedWindow(self.root, orient="vertical")
-        self.pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
+        # 中央：上持有者表格 / 下日志，自制 sash 分隔（拖动松手生效）。
+        # 曾用 ttk.PanedWindow：实时重排 × CTk 重绘链慢，真机拖动明细条
+        # 被挤扁、按钮残影（2026-11-17 咩咩两轮反馈）——拖动过程改为只移
+        # 指示线（wm_geometry 移动零重排），松手一次到位
+        self.center = tk.Frame(self.root, bg=BG)
+        self.center.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
+        self.center.rowconfigure(0, weight=1)  # 表格区弹性
+        self.center.rowconfigure(2, weight=0)
+        self.center.columnconfigure(0, weight=1)
 
-        tree_frame = tk.Frame(self.pw, bg=BG)
+        tree_frame = tk.Frame(self.center, bg=BG)
+        tree_frame.grid(row=0, column=0, sticky="nsew")
         # ttk.Treeview 深色化一处配置（clam 主题才吃 fieldbackground；
         # 默认 vista/w11 主题的 Treeview 配色改不动）
         style = ttk.Style(self.root)
@@ -434,12 +441,23 @@ class App:
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
 
-        self.pw.add(tree_frame, weight=3)
-        self._build_log_pane(self.pw)
-        # 初始 sash 位置：表格为主，日志区保持可见（sashpos 传逻辑值——
-        # ttk 内部会按 DPI 再缩放，乘 scaling 是双重缩放，420×scale 直接把
-        # 日志区挤没了，2026-11-17 咩咩真机截图实证）。用户仍可拖
-        self.root.after(200, lambda: self.pw.sashpos(0, 400))
+        # 日志区：固定初始高度（物理 540 = 360 逻辑@150%；tk 原生容器像素
+        # 是物理值），表格区弹性吸收余量；松手拖动改这里
+        sash_bar = tk.Frame(self.center, bg=BORDER, height=6,
+                            cursor="sb_v_double_arrow")
+        sash_bar.grid(row=1, column=0, sticky="ew", pady=2)
+        self.log_holder = ctk.CTkFrame(self.center, fg_color="transparent",
+                                       height=360)
+        self.log_holder.grid(row=2, column=0, sticky="ew")
+        self.log_holder.grid_propagate(False)  # 显式高度锁定（内容 requested 不稳）
+        self._build_log_pane(self.log_holder)
+        # 自制 sash 拖动：按下建指示线 → Motion 只移线（零布局重排）→
+        # 松手一次性改日志区高度
+        self._sash_line = None
+        self._sash_drag_y = 0
+        sash_bar.bind("<ButtonPress-1>", self._sash_press)
+        sash_bar.bind("<B1-Motion>", self._sash_motion)
+        sash_bar.bind("<ButtonRelease-1>", self._sash_release)
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
@@ -473,10 +491,8 @@ class App:
         self.menu.add_command(label="复制进程路径", command=self._copy_path)
         self.menu.add_command(label="打开文件位置", command=self._open_location)
 
-    def _build_log_pane(self, pw):
-        frame = ctk.CTkFrame(pw, fg_color="transparent")
-        pw.add(frame, weight=1)
-        topbar = ctk.CTkFrame(frame, fg_color="transparent")
+    def _build_log_pane(self, holder):
+        topbar = ctk.CTkFrame(holder, fg_color="transparent")
         topbar.pack(side="top", fill="x", padx=4, pady=(4, 0))
         self._ghost_button(topbar, "清空", width=64,
                            command=self._clear_log).pack(side="left")
@@ -487,7 +503,7 @@ class App:
                      text_color=MUTED, font=(FONT_FAMILY, 12)).pack(
             side="left", padx=6)
 
-        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body = ctk.CTkFrame(holder, fg_color="transparent")
         body.pack(side="top", fill="both", expand=True, padx=4, pady=4)
         # CTkTextbox：底色面板色（与窗口底区分出边界）；wrap=word 长行换行
         #（切换编排输出是行文本，横滚找内容不如换行直读，横滚条撤掉）
@@ -503,6 +519,54 @@ class App:
         ysb.grid(row=0, column=1, sticky="ns")
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
+
+    # ------------------------------------------------------------- sash 拖动
+
+    def _cui_scale(self) -> float:
+        try:
+            return ctk.ScalingTracker.get_window_scaling(self.root)
+        except Exception:
+            return 1.0
+
+    def _sash_press(self, e):
+        """按下：建全宽指示线（overrideredirect 细横条，wm_geometry 移动
+        零重排——拖动全程不触发布局，CTk 重绘链慢的根治之道）。"""
+        self._sash_drag_y = e.y_root
+        line = tk.Toplevel(self.root)
+        line.overrideredirect(True)
+        w = max(200, self.center.winfo_width())
+        line.geometry(f"{w}x3+{self.center.winfo_rootx()}+{e.y_root}")
+        try:  # 指示线主色
+            hwnd = ctypes.windll.user32.GetParent(line.winfo_id())
+            color = 0xF84493  # ACCENT #4493f8 → COLORREF 0xBBGGRR
+            for attr in (35, 34):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(ctypes.c_int(color)), 4)
+        except Exception:
+            pass
+        self._sash_line = line
+
+    def _sash_motion(self, e):
+        """拖动：只移指示线。范围约束=表格区最少留 180 物理像素（表头+
+        数行+明细），日志区最少 90 逻辑。"""
+        if self._sash_line is None:
+            return
+        top = self.center.winfo_rooty() + 180
+        bottom = (self.center.winfo_rooty() + self.center.winfo_height()
+                  - int(96 * self._cui_scale()))
+        y = max(top, min(e.y_root, bottom))
+        self._sash_drag_y = y
+        self._sash_line.geometry(f"+{self.center.winfo_rootx()}+{y}")
+
+    def _sash_release(self, _e):
+        """松手：按指示线最终位置一次性改日志区高度（唯一一次布局重排）。"""
+        if self._sash_line is not None:
+            self._sash_line.destroy()
+            self._sash_line = None
+        cont = self.center
+        log_top = self._sash_drag_y - cont.winfo_rooty()
+        new_phys = max(120, cont.winfo_height() - log_top - 6)
+        self.log_holder.configure(height=int(new_phys / self._cui_scale()))
 
     # ------------------------------------------------------------- 采样线程
 
@@ -1193,11 +1257,12 @@ class App:
         lines.append(f"fonts: tree={self.root.tk.call('font', 'actual', tree_font, '-family')} "
                      f"buttons=" + ",".join(
                          f"{str(b.cget('text'))}={b.cget('fg_color')}" for b in self._switch_buttons()))
-        # 主窗行几何（排「工具栏上方空白带」类布局问题：行高应贴内容）
-        bar_w = self.pw.master.grid_slaves(1, 0)[0]
+        # 主窗行几何（排「工具栏上方空白带」类布局问题：行高应贴内容；
+        # 中央区验证：表格弹性/日志锁定高度各自就位）
+        bar_w = self.center.master.grid_slaves(1, 0)[0]
         lines.append(f"layout: gpu_bar_y={self.gpu_bar.winfo_y()} gpu_bar_h={self.gpu_bar.winfo_height()} "
                      f"bar_y={bar_w.winfo_y()} bar_h={bar_w.winfo_height()} "
-                     f"pw_y={self.pw.winfo_y()} sash0={self.pw.sashpos(0)}")
+                     f"tree_h={self.tree.winfo_height()} log_h={self.log_holder.winfo_height()}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
