@@ -1,4 +1,4 @@
-"""独显占用侦探 —— 图形界面版（单文件，纯标准库，复用 dgpu_detective 引擎）。
+"""独显占用侦探 —— 图形界面版（单文件，复用 dgpu_detective 引擎，界面层 CustomTkinter 深色主题）。
 
 - 持有者表格 = --report/--watch 的常驻版：自动刷新，新持有黄底高亮
 - 显示模式徽章 = --status 四态凭证（内屏路由 / PnP problem / DXGI / GCU 意图回报），
@@ -27,20 +27,15 @@ import threading
 import time
 import traceback
 
+import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import dgpu_detective as eng
 
+# DPI 感知交 CTk 内部处理（自调 shcore 会与 CTk 的 scaling 叠加缩放，已删）
+
 # ---------------------------------------------------------------------------
-
-
-def enable_dpi_awareness() -> None:
-    """SYSTEM_DPI_AWARE，防高 DPI 下文字发糊；必须在 Tk() 创建前调用。"""
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
 
 
 def co_init() -> None:
@@ -149,7 +144,7 @@ class App:
     POLL_MS = 150
     NV_SCAN_S = 3.0  # 驱动层扫描节奏：全系统模块快照单轮数百 ms，独立线程跑不拖采样
 
-    def __init__(self, root: tk.Tk, adapters: list):
+    def __init__(self, root: ctk.CTk, adapters: list):
         self.root = root
         root.title("独显占用侦探")
         # 三切换按钮（核显省电/混合模式/独显直连）在工具栏单行可见；
@@ -949,7 +944,7 @@ class App:
         self.root.destroy()
 
 
-def _move_offscreen(root: tk.Tk) -> None:
+def _move_offscreen(root: ctk.CTk) -> None:
     """测试钩子（DGPU_TEST_OFFSCREEN=1）：窗口映射前移屏幕外 + 不进任务栏 +
     不抢焦点——正常启动不触发。"""
     root.update_idletasks()
@@ -964,8 +959,9 @@ def _move_offscreen(root: tk.Tk) -> None:
 
 
 def main() -> int:
-    enable_dpi_awareness()
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     try:
         adapters = eng.enumerate_adapters()
     except OSError as e:
