@@ -441,23 +441,37 @@ class App:
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
 
-        # 日志区：固定初始高度（物理 540 = 360 逻辑@150%；tk 原生容器像素
-        # 是物理值），表格区弹性吸收余量；松手拖动改这里
-        sash_bar = tk.Frame(self.center, bg=BORDER, height=6,
-                            cursor="sb_v_double_arrow")
-        sash_bar.grid(row=1, column=0, sticky="ew", pady=2)
-        self.log_holder = ctk.CTkFrame(self.center, fg_color="transparent",
-                                       height=360)
+        # sash 分隔条（6px，悬停显示上下箭头光标）
+        self.sash_bar = tk.Frame(self.center, bg=BORDER, height=6,
+                                 cursor="sb_v_double_arrow")
+        self.sash_bar.grid(row=1, column=0, sticky="ew", pady=2)
+        # 日志区容器：原生 tk.Frame——CTkFrame.configure(height) 只更新
+        # CTk 内部变量与画布，从不改 tk.Frame 的 height option/grid 请求，
+        # 运行时改高度完全无效（探针 B2 实证 366→366 弹回的真凶之二）。
+        # 高度=物理像素；ScalingTracker 此刻未必就位（实测返回 1.0），
+        # 用 tk 层真实 DPI 换算
+        try:
+            _s = max(1.0, root.winfo_fpixels("1i") / 96)
+        except Exception:
+            _s = 1.0
+        self.log_holder = tk.Frame(self.center, bg=BG,
+                                   height=int(360 * _s))
         self.log_holder.grid(row=2, column=0, sticky="ew")
-        self.log_holder.grid_propagate(False)  # 显式高度锁定（内容 requested 不稳）
+        # holder 内部是 pack 布局——必须锁 pack_propagate（曾错锁
+        # grid_propagate：configure(height) 被 pack 内容请求顶回，高度纹丝不动）
+        self.log_holder.pack_propagate(False)
         self._build_log_pane(self.log_holder)
-        # 自制 sash 拖动：按下建指示线 → Motion 只移线（零布局重排）→
-        # 松手一次性改日志区高度
-        self._sash_line = None
-        self._sash_drag_y = 0
-        sash_bar.bind("<ButtonPress-1>", self._sash_press)
-        sash_bar.bind("<B1-Motion>", self._sash_motion)
-        sash_bar.bind("<ButtonRelease-1>", self._sash_release)
+        # 自制 sash 拖动：按下显示指示条 → Motion 只挪指示条（place 定位
+        # 零重排）→ 松手一次性改日志区高度。
+        # 指示条必须是主窗内部的 Canvas 子窗（place 叠加）——曾用
+        # overrideredirect Toplevel：悬浮窗永远贴在指针正下方，Windows 把
+        # 鼠标事件全给了它，sash 条收不到 Motion/Release（真机「拖下去
+        # 弹回」实证）；主窗子窗不参与指针捕获争夺，事件流稳
+        self._sash_line = tk.Canvas(self.center, height=3, bg=ACCENT,
+                                    bd=0, highlightthickness=0)
+        self.sash_bar.bind("<ButtonPress-1>", self._sash_press)
+        self.sash_bar.bind("<B1-Motion>", self._sash_motion)
+        self.sash_bar.bind("<ButtonRelease-1>", self._sash_release)
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
@@ -492,7 +506,9 @@ class App:
         self.menu.add_command(label="打开文件位置", command=self._open_location)
 
     def _build_log_pane(self, holder):
-        topbar = ctk.CTkFrame(holder, fg_color="transparent")
+        # holder 是原生 tk.Frame（拖动高度可改），CTk 子控件的 transparent
+        # 取父链 CTk 色会落主题默认——显式给 BG
+        topbar = ctk.CTkFrame(holder, fg_color=BG)
         topbar.pack(side="top", fill="x", padx=4, pady=(4, 0))
         self._ghost_button(topbar, "清空", width=64,
                            command=self._clear_log).pack(side="left")
@@ -503,7 +519,7 @@ class App:
                      text_color=MUTED, font=(FONT_FAMILY, 12)).pack(
             side="left", padx=6)
 
-        body = ctk.CTkFrame(holder, fg_color="transparent")
+        body = ctk.CTkFrame(holder, fg_color=BG)
         body.pack(side="top", fill="both", expand=True, padx=4, pady=4)
         # CTkTextbox：底色面板色（与窗口底区分出边界）；wrap=word 长行换行
         #（切换编排输出是行文本，横滚找内容不如换行直读，横滚条撤掉）
@@ -529,44 +545,30 @@ class App:
             return 1.0
 
     def _sash_press(self, e):
-        """按下：建全宽指示线（overrideredirect 细横条，wm_geometry 移动
-        零重排——拖动全程不触发布局，CTk 重绘链慢的根治之道）。"""
-        self._sash_drag_y = e.y_root
-        line = tk.Toplevel(self.root)
-        line.overrideredirect(True)
-        w = max(200, self.center.winfo_width())
-        line.geometry(f"{w}x3+{self.center.winfo_rootx()}+{e.y_root}")
-        try:  # 指示线主色
-            hwnd = ctypes.windll.user32.GetParent(line.winfo_id())
-            color = 0xF84493  # ACCENT #4493f8 → COLORREF 0xBBGGRR
-            for attr in (35, 34):
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(ctypes.c_int(color)), 4)
-        except Exception:
-            pass
-        self._sash_line = line
+        """按下：显示指示条（place 叠加的主窗子窗，挪动零重排）。"""
+        self._sash_line.place(x=0, relwidth=1,
+                              y=self.sash_bar.winfo_rooty()
+                              - self.center.winfo_rooty() + 2)
 
     def _sash_motion(self, e):
-        """拖动：只移指示线。范围约束=表格区最少留 180 物理像素（表头+
-        数行+明细），日志区最少 90 逻辑。"""
-        if self._sash_line is None:
-            return
-        top = self.center.winfo_rooty() + 180
-        bottom = (self.center.winfo_rooty() + self.center.winfo_height()
-                  - int(96 * self._cui_scale()))
-        y = max(top, min(e.y_root, bottom))
-        self._sash_drag_y = y
-        self._sash_line.geometry(f"+{self.center.winfo_rootx()}+{y}")
+        """拖动：只挪指示条（place_configure 改 y，无布局重排）。
+        范围约束=表格区最少留 180 物理像素、日志区最少 96 逻辑。"""
+        cont = self.center
+        rel_y = max(180, min(e.y_root - cont.winfo_rooty(),
+                             cont.winfo_height() - int(96 * self._cui_scale())))
+        self._sash_drag_rel = rel_y
+        self._sash_line.place_configure(y=rel_y)
 
     def _sash_release(self, _e):
-        """松手：按指示线最终位置一次性改日志区高度（唯一一次布局重排）。"""
-        if self._sash_line is not None:
-            self._sash_line.destroy()
-            self._sash_line = None
-        cont = self.center
-        log_top = self._sash_drag_y - cont.winfo_rooty()
-        new_phys = max(120, cont.winfo_height() - log_top - 6)
-        self.log_holder.configure(height=int(new_phys / self._cui_scale()))
+        """松手：按指示条位置一次性改日志区高度（唯一一次布局重排）。
+        log_holder 是原生 tk.Frame——height 直接物理像素。"""
+        self._sash_line.place_forget()
+        if not getattr(self, "_sash_drag_rel", None):
+            return  # 没发生过拖动（只点了下）
+        rel_y = self._sash_drag_rel
+        self._sash_drag_rel = None
+        self.log_holder.configure(
+            height=max(120, self.center.winfo_height() - rel_y - 6))
 
     # ------------------------------------------------------------- 采样线程
 
