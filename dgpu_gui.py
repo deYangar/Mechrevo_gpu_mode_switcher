@@ -1120,23 +1120,27 @@ class App:
         win.resizable(False, False)
         holder = ctk.CTkFrame(win, fg_color=BG, corner_radius=0)
         holder.pack(fill="both", expand=True)
-        ctk.CTkLabel(holder, text=prompt, wraplength=540,
-                     justify="left", text_color=TEXT,
-                     font=(FONT_FAMILY, 12)).pack(padx=16, pady=14)
 
         def answer(v: str):
             bridge.ans_q.put(v)
             win.destroy()
 
-        # 编号问答按钮化：解析 prompt 里的「[N] 描述」逐项一钮，[回车/其他] 描述=取消项；
-        # 解析不出编号（兜底问答）才退回输入框。
-        # 三档视觉：危险项（立即重启）红、回车默认安全项主色、其余中性、取消描边
+        def add_label(text: str):
+            ctk.CTkLabel(holder, text=text, wraplength=540,
+                         justify="left", text_color=TEXT,
+                         font=(FONT_FAMILY, 12)).pack(padx=16, pady=(14, 4))
+
+        # 编号问答按钮化：解析 prompt 里的「[N] 描述」逐项一钮；
+        # 解析不出编号（兜底问答）才退回输入框。纯按钮点选，不绑任何键盘事件。
+        # 三档视觉：危险项（立即重启）红、推荐项主色、其余中性、取消描边
         opts = re.findall(r"\[(\d+)\]\s*([^\[\]]+)", prompt)
-        m_cancel = re.search(r"\[回车[^\]]*\]\s*([^\[\]]+)", prompt)
         if opts:
+            # 引导文本 = 第一个选项标记之前的部分（可能为空），选项描述归按钮
+            intro = re.split(r"\[\d+\]|\[回车[^\]]*\]", prompt, maxsplit=1)[0].strip()
+            if intro:
+                add_label(intro)
             body = ctk.CTkFrame(holder, fg_color="transparent")
-            body.pack(padx=16, pady=(0, 14), fill="x")
-            focused = None
+            body.pack(padx=16, pady=(10 if intro else 14, 14), fill="x")
             want = "2" if "立即重启" in prompt else "1"
             for num, desc in opts:
                 desc = desc.strip()
@@ -1146,33 +1150,24 @@ class App:
                     fg, hover, tc = ACCENT, "#65a0f8", "#ffffff"
                 else:
                     fg, hover, tc = SURFACE2, BORDER, TEXT
-                b = ctk.CTkButton(body, text=f"{num}｜{desc}",
-                                  anchor="w", width=560,
-                                  height=34, corner_radius=6,
-                                  fg_color=fg, hover_color=hover, text_color=tc,
-                                  font=(FONT_FAMILY, 12),
-                                  command=lambda n=num: answer(n))
-                b.pack(fill="x", pady=3)
-                # 回车默认落在预期项（旧口径：重启三选焦点在 2=稍后自行重启，
-                # 一键回车不触发立即重启；清场确认仍默认 1）
-                if num == want:
-                    focused = b
-            cancel_desc = m_cancel.group(1).strip() if m_cancel else "取消切换"
-            cb = ctk.CTkButton(body, text=f"回车/其他｜{cancel_desc}",
-                               anchor="w", width=560, height=34,
-                               corner_radius=6, fg_color="transparent",
-                               hover_color=SURFACE2, border_width=1,
-                               border_color=BORDER, text_color=MUTED,
-                               font=(FONT_FAMILY, 12),
-                               command=lambda: answer(""))
-            cb.pack(fill="x", pady=(3, 0))
-            if focused:
-                focused.focus_set()
-                # 回车=默认安全侧：绑在问答窗上（焦点在窗内任何位置都生效；
-                # CTkButton 的 canvas 不吃键盘焦点，单绑按钮会漏）
-                win.bind("<Return>", lambda e: focused.invoke())
-            win.bind("<Escape>", lambda e: answer(""))
+                ctk.CTkButton(body, text=f"{num}｜{desc}",
+                              anchor="w", width=560,
+                              height=34, corner_radius=6,
+                              fg_color=fg, hover_color=hover, text_color=tc,
+                              font=(FONT_FAMILY, 12),
+                              command=lambda n=num: answer(n)).pack(fill="x", pady=3)
+            # 取消按钮：文字用取消项自身的说明（含语义，如「撤回指令恢复原模式」）
+            m_cancel = re.search(r"\[回车[^\]]*\]\s*([^\[\]]+)", prompt)
+            cancel_desc = m_cancel.group(1).strip() if m_cancel else "取消"
+            ctk.CTkButton(body, text=cancel_desc,
+                          anchor="w", width=560, height=34,
+                          corner_radius=6, fg_color="transparent",
+                          hover_color=SURFACE2, border_width=1,
+                          border_color=BORDER, text_color=MUTED,
+                          font=(FONT_FAMILY, 12),
+                          command=lambda: answer("")).pack(fill="x", pady=(3, 0))
         else:
+            add_label(prompt)
             entry = ctk.CTkEntry(holder, width=280, font=(FONT_FAMILY, 12))
             entry.pack(padx=16, pady=(0, 8))
             ctk.CTkButton(holder, text="确定", width=88, height=30,
