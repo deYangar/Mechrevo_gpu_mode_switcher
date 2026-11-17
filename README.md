@@ -46,11 +46,20 @@ python dgpu_detective.py --hybrid       # 回混合模式（目标态入口，�
 
 ## 图形界面（GUI / exe）
 
-源码运行：`python dgpu_gui.py`；构建单文件 exe：
+CustomTkinter 深色主题。源码运行需装界面层依赖（CLI 引擎仍是纯标准库）：
+
+```powershell
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple customtkinter
+python dgpu_gui.py
+```
+
+构建单文件 exe（约 12 MB，依赖自动打包，缺装会自检）：
 
 ```powershell
 pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefile + uac-admin）
 ```
+
+![深色界面](docs/gui_dark.png)
 
 - **exe 双击即请求管理员**（uac-admin 清单）——杀提权占用软件、切换省电都需要；
   切换编排原样复用命令行 `--eco` / `--direct` 代码，只是跑在内嵌控制台里
@@ -224,5 +233,6 @@ GUI 的重启三选走问答框，默认应答取安全侧（2=稍后自行重�
 
 | 文件 | 说明 |
 |---|---|
-| `dgpu_detective.py` | 主脚本（单文件，纯标准库） |
+| `dgpu_detective.py` | 命令行主脚本（单文件，纯标准库） |
+| `dgpu_gui.py` | 图形界面（CustomTkinter 深色主题，复用命令行引擎，界面层依赖 customtkinter） |
 | `reference/gputaskman-src/` | 参考仓库快照（上游 MIT 许可） |
