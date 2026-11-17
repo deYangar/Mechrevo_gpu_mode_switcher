@@ -90,7 +90,27 @@ def main() -> int:
     sb = next((l for l in lines if l.startswith("statusbar:")), "")
     m = re.search(r"badge_y=(\d+) ev_y=(\d+) ev_w=(\d+)", sb)
     check("两行布局 badge_y<ev_y", bool(m) and int(m.group(1)) < int(m.group(2)), sb)
-    check("ev_w>=800", bool(m) and int(m.group(3)) >= 800, sb)
+    # 阈值 700：三凭证全文在雅黑 11pt 的自然宽度 ~780px（1180 窗口）；
+    # 单行回退时被右侧元素挤没会显著低于此
+    check("ev_w>=700", bool(m) and int(m.group(3)) >= 700, sb)
+
+    # 9) 设计系统：表格字体族 = Microsoft YaHei UI（雅黑生效=不吃宋体回退）
+    fnt = next((l for l in lines if l.startswith("fonts:")), "")
+    m = re.search(r"tree=(.*?) buttons=", fnt)
+    check("表格字体=雅黑", bool(m) and m.group(1).lower() in (
+        "microsoft yahei ui", "{microsoft yahei ui}"), fnt[:90])
+
+    # 10) 态式按钮：至多一个实色（fg_color 非 transparent），其余描边
+    m = re.search(r"buttons=([^\s]+)", fnt)
+    fgs = [kv.split("=", 1)[1] for kv in m.group(1).split(",")] if m else []
+    solid = [c for c in fgs if c and c != "transparent"]
+    check("态式按钮（至多一个实色）", bool(fgs) and len(solid) <= 1, str(fgs))
+
+    # 11) 布局几何：工具栏高度贴内容（竖分隔 CTkFrame 默认 200 高会把
+    # 工具栏撑到 ~300px、按钮挤中间留大空白——28pt 控件行正常 ~42px）
+    lay = next((l for l in lines if l.startswith("layout:")), "")
+    m = re.search(r" bar_h=(\d+)", lay)
+    check("工具栏高度贴内容 bar_h<=80", bool(m) and int(m.group(1)) <= 80, lay)
 
     n_ok = sum(results)
     print(f"--- {n_ok}/{len(results)} PASS ---")

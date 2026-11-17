@@ -70,14 +70,67 @@ def short_gpu(name: str) -> str:
     return n if len(n) <= 26 else n[:25] + "…"
 
 
-MODE_COLORS = {  # 徽章配色（深色主题）：fg 文字, bg 底
-    "hybrid": ("#86e29b", "#1f5130"),
-    "igpu_only": ("#8fc4ff", "#1d3a6b"),
-    "pnp_disabled": ("#ffcf8f", "#6b4a1a"),
-    "dgpu_direct": ("#d4b3ff", "#4a2a6b"),
-    "direct_pending": ("#ffe08f", "#6b551a"),
-    "unknown": ("#ff9f9f", "#6b1f1f"),
+# ---------------------------------------------------------------------------
+# 设计系统：单色板源（GitHub Dark 系），全界面颜色/字体只从这里取。
+# 中文统一 Microsoft YaHei UI（CTk 默认 Roboto 无中文字形会回退宋体——
+# 迁移后「丑」的根源）；雅黑数字为 tabular 等宽（实测 0/1 同宽 9px@12pt），
+# 表格数字列与时间戳排版不受比例宽影响，不需要 Consolas（其无中文字形）。
+
+BG = "#0d1117"        # 窗口底
+SURFACE = "#161b22"   # 卡片/面板
+SURFACE2 = "#21262d"  # 次级面板/输入底/表格 field
+BORDER = "#30363d"    # 边框/分隔
+TEXT = "#e6edf3"      # 主文字
+MUTED = "#8b949e"     # 次要文字
+ACCENT = "#4493f8"    # 主色
+ACCENT_DARK = "#1e3a5f"  # 选中底（表格行选中）
+GREEN = "#3fb950"     # 成功/核显省电
+GREEN_HOVER = "#46c05a"
+PURPLE = "#a371f7"    # 独显直连
+PURPLE_HOVER = "#b284f8"
+YELLOW = "#e3b341"    # 警示/保护名单
+RED = "#f85149"       # 危险/错误（只给「危险操作」与「故障态」，不做行底色）
+
+FONT_FAMILY = "Microsoft YaHei UI"
+
+MODE_COLORS = {  # 徽章配色：fg 文字, bg 底
+    "hybrid": ("#7ee787", "#1b3522"),
+    "igpu_only": ("#79c0ff", "#1c2e4a"),
+    "pnp_disabled": ("#f0883e", "#3d2b12"),
+    "dgpu_direct": ("#d2a8ff", "#31215c"),
+    "direct_pending": ("#e3b341", "#3d2e12"),
+    "unknown": ("#f85149", "#45191c"),
 }
+
+SWITCH_COLORS = {  # 切换按钮当前态实色：与徽章的模式-颜色心智映射呼应
+    "direct_on": (PURPLE, PURPLE_HOVER),
+    "hybrid": (ACCENT, "#65a0f8"),
+    "on": (GREEN, GREEN_HOVER),
+}
+
+
+def apply_theme() -> None:
+    """全局主题：窗口底色 + CTk 主题表 patch（checkbox/combobox/scrollbar 等
+    不逐个显式配色的控件跟着 ACCENT 走）。在建控件前调用。"""
+    theme = ctk.ThemeManager.theme
+    for cls, key, val in (
+            ("CTkCheckBox", "fg_color", ACCENT),
+            ("CTkCheckBox", "hover_color", "#65a0f8"),
+            ("CTkComboBox", "button_color", SURFACE2),
+            ("CTkComboBox", "button_hover_color", BORDER),
+            ("CTkComboBox", "border_color", BORDER),
+            ("CTkComboBox", "fg_color", SURFACE2),
+            ("CTkDropdownMenu", "fg_color", SURFACE2),
+            ("CTkDropdownMenu", "hover_color", BORDER),
+            ("CTkScrollbar", "button_color", BORDER),
+            ("CTkScrollbar", "button_hover_color", MUTED),
+            ("CTkProgressBar", "fg_color", ACCENT),
+            ("CTkProgressBar", "progress_color", ACCENT),
+            ("CTkTextbox", "border_color", BORDER)):
+        try:
+            theme[cls][key] = val
+        except KeyError:
+            pass  # 主题表结构随 CTk 版本变化，缺项跳过（显式配色不依赖它）
 
 
 @contextlib.contextmanager
@@ -195,13 +248,34 @@ class App:
 
     # ------------------------------------------------------------- UI 构建
 
+    def _ghost_button(self, master, text, width=88, command=None):
+        """次级按钮统一 ghost 风：透明底 + 描边，主色只留给「当前模式」。"""
+        b = ctk.CTkButton(master, text=text, width=width, height=28,
+                          fg_color="transparent", hover_color=SURFACE2,
+                          border_width=1, border_color=BORDER,
+                          text_color=TEXT, corner_radius=6,
+                          font=(FONT_FAMILY, 12), command=command)
+        return b
+
+    def _style_switch(self, btn, target: str, active: bool):
+        """切换按钮态式：当前模式的按钮实色高亮，其余中性描边——
+        一眼读出「现在在哪个模式、能去哪」；彩-模式映射与徽章呼应。"""
+        color, hover = SWITCH_COLORS[target]
+        if active:
+            btn.configure(fg_color=color, hover_color=hover,
+                          border_width=0, text_color="#ffffff")
+        else:
+            btn.configure(fg_color="transparent", hover_color=SURFACE2,
+                          border_width=1, border_color=BORDER,
+                          text_color=MUTED)
+
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
-        # 顶部：GPU 概要条
+        # 顶部：GPU 概要条（卡片横排，结构见 _chip）
         self.gpu_bar = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.gpu_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
+        self.gpu_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
 
         # 工具条
         bar = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -209,64 +283,72 @@ class App:
 
         self.auto_var = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(bar, text="自动刷新", variable=self.auto_var,
+                        font=(FONT_FAMILY, 12),
                         command=self._on_auto_toggle).pack(side="left")
-        ctk.CTkLabel(bar, text="间隔(s)").pack(side="left", padx=(10, 2))
+        ctk.CTkLabel(bar, text="间隔(s)", font=(FONT_FAMILY, 12),
+                     text_color=MUTED).pack(side="left", padx=(10, 2))
         # CTk 无 Spinbox：ComboBox 可输可选兜住（预设 0.5~10.0 步进 0.5，
         # 手输其他值仍按 _on_interval 的 0.5~10 校验收）
         self.interval_spin = ctk.CTkComboBox(
             bar, values=[f"{0.5 * i:.1f}" for i in range(1, 21)], width=88,
-            height=28, command=self._on_interval)
+            height=28, font=(FONT_FAMILY, 12), dropdown_font=(FONT_FAMILY, 12),
+            command=self._on_interval)
         self.interval_spin.set("1.0")
         self.interval_spin.pack(side="left")
         self.interval_spin.bind("<FocusOut>", lambda e: self._on_interval())
-        ctk.CTkButton(bar, text="立即刷新", width=88, height=28,
-                      command=self._refresh_now).pack(side="left", padx=6)
+        self._ghost_button(bar, "立即刷新", command=self._refresh_now).pack(
+            side="left", padx=6)
         self.all_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(bar, text="含核显", variable=self.all_var,
+                        font=(FONT_FAMILY, 12),
                         command=self._on_include_all).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(bar, text="导出 JSON", width=88, height=28,
-                      command=self._export_json).pack(side="left", padx=6)
+        self._ghost_button(bar, "导出 JSON", command=self._export_json).pack(
+            side="left", padx=6)
 
-        ctk.CTkFrame(bar, width=2, corner_radius=0,
-                     fg_color="#3a3a3a").pack(side="left", fill="y", padx=8)
+        # 竖分隔线：CTkFrame 默认 height=200 逻辑，fill="y" 会把整条工具栏撑到
+        # 300px 高、按钮挤中间留大片空白——高度必须显式给小
+        ctk.CTkFrame(bar, width=1, height=22, corner_radius=0,
+                     fg_color=BORDER).pack(side="left", fill="y", padx=10)
         # 按性能排：独显直连（独显全力）→ 混合模式 → 核显省电（独显下线）；
         # 混合模式 = 目标态入口，cmd_hybrid 按当前态自动挑路
-        # （省电态走 MQTT 回线、直连态走 MUX 重启三选），曾是两个互斥按钮
+        # （省电态走 MQTT 回线、直连态走 MUX 重启三选），曾是两个互斥按钮。
+        # 态式：默认中性描边，当前模式的按钮由 _update_switch_buttons 点亮
         self.direct_on_btn = ctk.CTkButton(
             bar, text="独显直连", width=96, height=28,
-            fg_color="#6a3fa0", hover_color="#59348a",
+            corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("direct_on"))
         self.direct_on_btn.pack(side="left")
         self.hybrid_btn = ctk.CTkButton(
             bar, text="混合模式", width=96, height=28,
-            fg_color="#1f6aa5", hover_color="#1a5789",
+            corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("hybrid"))
         self.hybrid_btn.pack(side="left", padx=6)
         self.eco_on_btn = ctk.CTkButton(
             bar, text="核显省电", width=96, height=28,
-            fg_color="#2f7d4f", hover_color="#276a42",
+            corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("on"))
         self.eco_on_btn.pack(side="left")
 
         # 中央：上持有者表格 / 下 Notebook，可拖分界
-        pw = ttk.PanedWindow(self.root, orient="vertical")
-        pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
+        self.pw = ttk.PanedWindow(self.root, orient="vertical")
+        self.pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
 
-        tree_frame = ctk.CTkFrame(pw, fg_color="transparent")
+        tree_frame = ctk.CTkFrame(self.pw, fg_color="transparent")
         # ttk.Treeview 深色化一处配置（clam 主题才吃 fieldbackground；
         # 默认 vista/w11 主题的 Treeview 配色改不动）
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("Dgpu.Treeview", fieldbackground="#2b2b2b",
-                        background="#2b2b2b", foreground="#dce4ee",
-                        rowheight=26, borderwidth=0)
-        style.configure("Dgpu.Treeview.Heading", background="#3a3a3a",
-                        foreground="#cfd8e3", relief="flat", borderwidth=0,
-                        font=("TkDefaultFont", 9, "bold"))
+        style.configure("Dgpu.Treeview", fieldbackground=SURFACE,
+                        background=SURFACE, foreground=TEXT,
+                        rowheight=28, borderwidth=0,
+                        font=(FONT_FAMILY, 10))
+        style.configure("Dgpu.Treeview.Heading", background=SURFACE2,
+                        foreground=MUTED, relief="flat", borderwidth=0,
+                        font=(FONT_FAMILY, 10, "bold"))
         style.map("Dgpu.Treeview",
-                  background=[("selected", "#22527e")],
-                  fieldbackground=[("selected", "#22527e")])
-        style.map("Dgpu.Treeview.Heading", background=[("active", "#454545")])
+                  background=[("selected", ACCENT_DARK)],
+                  fieldbackground=[("selected", ACCENT_DARK)])
+        style.map("Dgpu.Treeview.Heading", background=[("active", BORDER)])
         cols = ("gpu", "pid", "name", "local", "nonlocal", "committed", "engines",
                 "nvmods")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
@@ -287,44 +369,55 @@ class App:
         # 明细只剩右侧零头，默认窗口宽度下被挤成一条竖缝、路径全截断
         self.detail = ctk.CTkLabel(
             tree_frame, text="选中进程后这里显示完整路径与引擎明细",
-            wraplength=980, anchor="w", justify="left", text_color="#8a94a3")
+            wraplength=980, anchor="w", justify="left", text_color=MUTED,
+            font=(FONT_FAMILY, 11), fg_color=SURFACE,
+            corner_radius=6, padx=8, pady=3)
         self.detail.pack(side="bottom", fill="x")
         self.detail.bind(
             "<Configure>",
             lambda e: self.detail.configure(wraplength=max(200, e.width - 8)))
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
-        self.tree.tag_configure("new", background="#5a4d1a",
-                                foreground="#ffe08f")            # 新持有高亮
-        self.tree.tag_configure("igpu", background="#1c2a45")    # 核显行
-        self.tree.tag_configure("nvdrv", background="#35284a")   # 驱动层口径行（WDDM 不可见）
-        self.tree.tag_configure("prot", foreground="#ff8f8f")    # 系统/服务组件
+        self.tree.tag_configure("new", background="#3d2e12",
+                                foreground=YELLOW)              # 新持有高亮
+        self.tree.tag_configure("igpu", background="#141d2e")    # 核显行
+        self.tree.tag_configure("nvdrv", background="#191430")   # 驱动层口径行
+        self.tree.tag_configure("odd", background="#12161d")     # 斑马纹
+        # 系统/服务组件：警示黄（整行红是红色滥用，黄=「不建议结束」的份量）
+        self.tree.tag_configure("prot", foreground=YELLOW)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
 
-        pw.add(tree_frame, weight=3)
-        self._build_log_pane(pw)
+        self.pw.add(tree_frame, weight=3)
+        self._build_log_pane(self.pw)
+        # 初始 sash 位置：表格为主（requested 高度只随首帧行数走，行少时
+        # 日志区会反客为主，显式定表 320/日志余量，用户仍可拖）
+        self.root.after(200, lambda: self.pw.sashpos(0, 320))
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
         sb = ctk.CTkFrame(self.root, fg_color="transparent")
-        sb.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 6))
+        sb.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 8))
         sb.columnconfigure(0, weight=1)
-        self.mode_badge = ctk.CTkLabel(sb, text=" … ", corner_radius=8,
-                                       fg_color="#3a3a3a", text_color="#dce4ee",
-                                       padx=10, pady=2)
+        self.mode_badge = ctk.CTkLabel(sb, text=" … ", corner_radius=10,
+                                       fg_color=SURFACE2, text_color=TEXT,
+                                       padx=12, pady=3, font=(FONT_FAMILY, 11))
         self.mode_badge.grid(row=0, column=0, sticky="w")
         admin = "管理员 ✓" if eng.is_admin() else "管理员 ✗（杀提权进程/切换需提权）"
         self.admin_label = ctk.CTkLabel(
-            sb, text=admin,
-            text_color=("#86e29b" if eng.is_admin() else "#ff9f9f"))
+            sb, text=admin, font=(FONT_FAMILY, 11),
+            text_color=(GREEN if eng.is_admin() else RED))
         self.admin_label.grid(row=0, column=1, sticky="e")
-        self.refresh_label = ctk.CTkLabel(sb, text="", text_color="#8a94a3")
+        self.refresh_label = ctk.CTkLabel(sb, text="", text_color=MUTED,
+                                          font=(FONT_FAMILY, 11))
         self.refresh_label.grid(row=0, column=2, sticky="e", padx=(10, 0))
-        self.evidence = ctk.CTkLabel(sb, text="三凭证读取中…", text_color="#8a94a3")
-        self.evidence.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self.evidence = ctk.CTkLabel(sb, text="三凭证读取中…", text_color=MUTED,
+                                     font=(FONT_FAMILY, 11))
+        self.evidence.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
-        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu = tk.Menu(self.root, tearoff=0,
+                            bg=SURFACE2, fg=TEXT, activebackground=ACCENT_DARK,
+                            activeforeground=TEXT, bd=0)
         self.menu.add_command(label="结束进程树（PID）", command=lambda: self._kill(by_pid=True))
         self.menu.add_command(label="结束全部同名进程（含子进程树）", command=lambda: self._kill(by_pid=False))
         self.menu.add_separator()
@@ -337,31 +430,29 @@ class App:
         pw.add(frame, weight=1)
         topbar = ctk.CTkFrame(frame, fg_color="transparent")
         topbar.pack(side="top", fill="x", padx=4, pady=(4, 0))
-        ctk.CTkButton(topbar, text="清空", width=64, height=28,
-                      command=self._clear_log).pack(side="left")
-        ctk.CTkButton(topbar, text="打开日志目录", width=110, height=28,
-                      command=self._open_log_dir).pack(side="left", padx=6)
-        ctk.CTkLabel(topbar, text="切换按钮在下方运行完整切换编排，"
+        self._ghost_button(topbar, "清空", width=64,
+                           command=self._clear_log).pack(side="left")
+        self._ghost_button(topbar, "打开日志目录", width=110,
+                           command=self._open_log_dir).pack(side="left", padx=6)
+        ctk.CTkLabel(topbar, text="切换按钮在上方运行完整切换编排，"
                                   "输出同步留档 logs/（eco_/hybrid_/direct_）",
-                     text_color="#8a94a3").pack(side="left", padx=6)
+                     text_color=MUTED, font=(FONT_FAMILY, 11)).pack(
+            side="left", padx=6)
 
         body = ctk.CTkFrame(frame, fg_color="transparent")
         body.pack(side="top", fill="both", expand=True, padx=4, pady=4)
-        # CTkTextbox：底色比组件底再深一档（编辑器感）；wrap=none 保长行横滚
-        #（横滚异常即回退 tk.Text 深色配色，方案 §三-7 预案）
-        self.log_text = ctk.CTkTextbox(body, height=7, wrap="none",
-                                       font=("Consolas", 9),
-                                       fg_color="#1e1e1e",
-                                       text_color="#dce4ee",
+        # CTkTextbox：底色面板色（与窗口底区分出边界）；wrap=word 长行换行
+        #（切换编排输出是行文本，横滚找内容不如换行直读，横滚条撤掉）
+        self.log_text = ctk.CTkTextbox(body, height=6, wrap="word",
+                                       font=(FONT_FAMILY, 12),
+                                       fg_color=SURFACE,
+                                       text_color="#a8b3c2",
                                        state="disabled")
         ysb = ctk.CTkScrollbar(body, orientation="vertical",
                                command=self.log_text.yview)
-        xsb = ctk.CTkScrollbar(body, orientation="horizontal",
-                               command=self.log_text.xview)
-        self.log_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.log_text.configure(yscrollcommand=ysb.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
 
@@ -485,9 +576,12 @@ class App:
         seen_luids = set()
         for gpu in data:
             seen_luids.add(gpu["luid"])
-            mem_l, eng_l = self._chip(gpu["luid"], gpu["name"], gpu["discrete"])
+            mem_l, eng_l, pbar = self._chip(gpu["luid"], gpu["name"], gpu["discrete"])
             mem_l.configure(text=f"显存 {gpu['adapter_dedicated_mb']:.2f} / "
                                  f"{gpu['card_vram_mb']:.2f} MB")
+            ratio = (gpu["adapter_dedicated_mb"] / gpu["card_vram_mb"]
+                     if gpu["card_vram_mb"] > 0 else 0.0)
+            pbar.set(min(1.0, max(0.0, ratio)))
             best_k, best_v = "", 0.0
             for r in gpu["processes"]:
                 for k, v in r["engines"].items():
@@ -530,6 +624,7 @@ class App:
         self.rowmeta.clear()
         nv_map = {pid: mods for pid, _name, mods in self.nv_rows}
         wdm_pids = set()
+        row_i = 0
         for gpu in data:
             short = short_gpu(gpu["name"])
             for r in gpu["processes"]:
@@ -547,6 +642,9 @@ class App:
                 engstr = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
                 mods = nv_map.get(r["pid"])
                 mods_str = ", ".join(sorted(mods)) if mods else ""
+                if row_i % 2:
+                    tags.append("odd")  # 斑马纹挂在末位：语义 tag（new/prot）优先
+                row_i += 1
                 self.tree.insert("", "end", iid=iid, tags=tags, values=(
                     short, r["pid"], name, f"{r['local_mb']:.2f}",
                     f"{r['nonlocal_mb']:.2f}", f"{r['committed_mb']:.2f}", engstr,
@@ -561,6 +659,9 @@ class App:
             tags = ["nvdrv"]
             if is_protected(name):
                 tags.append("prot")
+            if row_i % 2:
+                tags.append("odd")
+            row_i += 1
             self.tree.insert("", "end", iid=iid, tags=tags, values=(
                 "驱动层（无上下文）", pid, name, "", "", "", "",
                 ", ".join(sorted(mods))))
@@ -575,19 +676,32 @@ class App:
 
     def _chip(self, luid, name, discrete):
         if luid not in self.chips:
-            # 卡片：顶部标题行 + 显存/引擎两行；描边色区分独显（紫）/核显（蓝），
-            # 与模式徽章配色呼应
+            # 横条面板段：GPU 名 | 显存数值 | 占用条 | 持有/引擎 横向排——
+            # 全宽铺满（多卡平分），顶行高度 ~56px，不留竖卡时代的两侧空白；
+            # 左缘色条区分独显（紫）/核显（蓝），与模式徽章配色呼应
             f = ctk.CTkFrame(self.gpu_bar, corner_radius=8, border_width=1,
-                             border_color=("#4a2a6b" if discrete else "#1d3a6b"))
-            f.pack(side="left", fill="y", padx=(0, 8))
+                             border_color=("#31215c" if discrete else "#1c2e4a"),
+                             fg_color=SURFACE, height=56)
+            f.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            f.pack_propagate(False)
+            ctk.CTkFrame(f, width=3, height=40, corner_radius=2,
+                         fg_color=("#a371f7" if discrete else "#4493f8")
+                         ).grid(row=0, column=0, rowspan=4,
+                                sticky="ns", padx=(10, 8), pady=8)
             ctk.CTkLabel(f, text=("独显 · " if discrete else "") + short_gpu(name),
-                         text_color="#dce4ee").grid(
-                row=0, column=0, sticky="w", padx=10, pady=(6, 0))
-            mem_l = ctk.CTkLabel(f, text="显存 …", text_color="#8a94a3")
-            mem_l.grid(row=1, column=0, sticky="w", padx=10)
-            eng_l = ctk.CTkLabel(f, text="…", text_color="#8a94a3")
-            eng_l.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
-            self.chips[luid] = (mem_l, eng_l)
+                         text_color=TEXT, font=(FONT_FAMILY, 12, "bold")).grid(
+                row=0, column=1, sticky="w", padx=(0, 14))
+            mem_l = ctk.CTkLabel(f, text="显存 …", text_color=MUTED,
+                                 font=(FONT_FAMILY, 11))
+            mem_l.grid(row=0, column=2, sticky="w", padx=(0, 10))
+            pbar = ctk.CTkProgressBar(f, height=5, corner_radius=3,
+                                      fg_color=SURFACE2, progress_color=ACCENT)
+            pbar.grid(row=0, column=3, sticky="ew", pady=2)
+            eng_l = ctk.CTkLabel(f, text="…", text_color=MUTED,
+                                 font=(FONT_FAMILY, 11))
+            eng_l.grid(row=0, column=4, sticky="w", padx=(14, 12))
+            f.columnconfigure(3, weight=1)  # 占用条吸收余宽
+            self.chips[luid] = (mem_l, eng_l, pbar)
         return self.chips[luid]
 
     def _apply_status(self, st):
@@ -640,14 +754,14 @@ class App:
             self.detail.configure(
                 text=f"驱动层口径：{m['image']}  (pid {m['pid']})\n"
                      f"加载 {mods}  ｜  无图形上下文，WDDM 表不可见（传感器轮询类软件在此现形）",
-                text_color="#dce4ee")
+                text_color=TEXT)
             return
         active = {k: v for k, v in m["engines"].items() if v > 0.05}
         engines = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
         prot = "  ｜ 系统/服务组件（保护名单，不建议结束）" if is_protected(m["image"]) else ""
         self.detail.configure(text=f"{m['image']}  (pid {m['pid']})\n"
                                    f"显存 {m['local_mb']:.2f} MB  ｜  {engines}{prot}",
-                              text_color="#dce4ee")
+                              text_color=TEXT)
 
     def _popup_menu(self, ev):
         iid = self.tree.identify_row(ev.y)
@@ -764,12 +878,19 @@ class App:
         return (self.direct_on_btn, self.hybrid_btn, self.eco_on_btn)
 
     def _update_switch_buttons(self):
-        """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）。"""
+        """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）；
+        态式配色：当前模式的按钮实色点亮，其余中性描边。"""
+        mode = self.last_st.mode if self.last_st else "unknown"
+        active = {"dgpu_direct": "direct_on", "igpu_only": "on",
+                  "hybrid": "hybrid"}.get(mode)
+        for target, b in (("direct_on", self.direct_on_btn),
+                          ("hybrid", self.hybrid_btn),
+                          ("on", self.eco_on_btn)):
+            self._style_switch(b, target, active == target)
         if self.switch_running:
             for b in self._switch_buttons():
                 b.configure(state="disabled")
             return
-        mode = self.last_st.mode if self.last_st else "unknown"
         i = self.gcu_info
         eco_ok = not (i and i.igpu_only is False)
         direct_ok = not (i and i.dgpu_direct is False)
@@ -839,40 +960,56 @@ class App:
         # 实测 mainloop 中窗口整个不出现。内容套一层 CTkFrame 深色容器：
         # CTk 控件的 transparent 取父链 CTk 色，直接挂原生 Toplevel 会落回
         # 主题默认浅色
-        win = tk.Toplevel(self.root, bg="#242424")
+        win = tk.Toplevel(self.root, bg=BG)
         win.title("切换问答")
         win.transient(self.root)
         win.resizable(False, False)
-        holder = ctk.CTkFrame(win, fg_color="#242424", corner_radius=0)
+        holder = ctk.CTkFrame(win, fg_color=BG, corner_radius=0)
         holder.pack(fill="both", expand=True)
         ctk.CTkLabel(holder, text=prompt, wraplength=540,
-                     justify="left").pack(padx=14, pady=14)
+                     justify="left", text_color=TEXT,
+                     font=(FONT_FAMILY, 12)).pack(padx=16, pady=14)
 
         def answer(v: str):
             bridge.ans_q.put(v)
             win.destroy()
 
         # 编号问答按钮化：解析 prompt 里的「[N] 描述」逐项一钮，[回车/其他] 描述=取消项；
-        # 解析不出编号（兜底问答）才退回输入框
+        # 解析不出编号（兜底问答）才退回输入框。
+        # 三档视觉：危险项（立即重启）红、回车默认安全项主色、其余中性、取消描边
         opts = re.findall(r"\[(\d+)\]\s*([^\[\]]+)", prompt)
         m_cancel = re.search(r"\[回车[^\]]*\]\s*([^\[\]]+)", prompt)
         if opts:
             body = ctk.CTkFrame(holder, fg_color="transparent")
-            body.pack(padx=14, pady=(0, 12), fill="x")
+            body.pack(padx=16, pady=(0, 14), fill="x")
             focused = None
+            want = "2" if "立即重启" in prompt else "1"
             for num, desc in opts:
-                b = ctk.CTkButton(body, text=f"{num}｜{desc.strip()}",
+                desc = desc.strip()
+                if "立即重启" in desc:
+                    fg, hover, tc = RED, "#c53a32", "#ffffff"
+                elif num == want:
+                    fg, hover, tc = ACCENT, "#65a0f8", "#ffffff"
+                else:
+                    fg, hover, tc = SURFACE2, BORDER, TEXT
+                b = ctk.CTkButton(body, text=f"{num}｜{desc}",
                                   anchor="w", width=560,
-                                  height=32, command=lambda n=num: answer(n))
+                                  height=34, corner_radius=6,
+                                  fg_color=fg, hover_color=hover, text_color=tc,
+                                  font=(FONT_FAMILY, 12),
+                                  command=lambda n=num: answer(n))
                 b.pack(fill="x", pady=3)
                 # 回车默认落在预期项（旧口径：重启三选焦点在 2=稍后自行重启，
                 # 一键回车不触发立即重启；清场确认仍默认 1）
-                want = "2" if "立即重启" in prompt else "1"
                 if num == want:
                     focused = b
             cancel_desc = m_cancel.group(1).strip() if m_cancel else "取消切换"
             cb = ctk.CTkButton(body, text=f"回车/其他｜{cancel_desc}",
-                               anchor="w", width=560, height=32,
+                               anchor="w", width=560, height=34,
+                               corner_radius=6, fg_color="transparent",
+                               hover_color=SURFACE2, border_width=1,
+                               border_color=BORDER, text_color=MUTED,
+                               font=(FONT_FAMILY, 12),
                                command=lambda: answer(""))
             cb.pack(fill="x", pady=(3, 0))
             if focused:
@@ -882,10 +1019,11 @@ class App:
                 win.bind("<Return>", lambda e: focused.invoke())
             win.bind("<Escape>", lambda e: answer(""))
         else:
-            entry = ctk.CTkEntry(holder, width=280)
-            entry.pack(padx=14, pady=(0, 8))
-            ctk.CTkButton(holder, text="确定", width=88,
-                          command=lambda: answer(entry.get())).pack(pady=(0, 12))
+            entry = ctk.CTkEntry(holder, width=280, font=(FONT_FAMILY, 12))
+            entry.pack(padx=16, pady=(0, 8))
+            ctk.CTkButton(holder, text="确定", width=88, height=30,
+                          corner_radius=6, font=(FONT_FAMILY, 12),
+                          command=lambda: answer(entry.get())).pack(pady=(0, 14))
             entry.bind("<Return>", lambda e: answer(entry.get()))
             entry.focus_set()
         # 居中于主窗口（Toplevel 默认落屏幕左上角，切换问答该跟着主窗走）
@@ -965,6 +1103,17 @@ class App:
         # 单行回退时两者 y 相等）
         lines.append(f"statusbar: badge_y={self.mode_badge.winfo_y()} "
                      f"ev_y={self.evidence.winfo_y()} ev_w={self.evidence.winfo_width()}")
+        # 设计系统落地核对：表格字体族（雅黑生效=不吃宋体回退）+
+        # 三切换按钮底色（态式=至多一个实色，其余 transparent 描边）
+        tree_font = self.root.tk.call("ttk::style", "lookup", "Dgpu.Treeview", "-font")
+        lines.append(f"fonts: tree={self.root.tk.call('font', 'actual', tree_font, '-family')} "
+                     f"buttons=" + ",".join(
+                         f"{str(b.cget('text'))}={b.cget('fg_color')}" for b in self._switch_buttons()))
+        # 主窗行几何（排「工具栏上方空白带」类布局问题：行高应贴内容）
+        bar_w = self.pw.master.grid_slaves(1, 0)[0]
+        lines.append(f"layout: gpu_bar_y={self.gpu_bar.winfo_y()} gpu_bar_h={self.gpu_bar.winfo_height()} "
+                     f"bar_y={bar_w.winfo_y()} bar_h={bar_w.winfo_height()} "
+                     f"pw_y={self.pw.winfo_y()} sash0={self.pw.sashpos(0)}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
@@ -1044,7 +1193,8 @@ def _dark_titlebar(root: ctk.CTk) -> None:
 def main() -> int:
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    root = ctk.CTk()
+    root = ctk.CTk(fg_color=BG)  # 全窗底色：CTk dark 默认 #242424 换设计系统底色
+    apply_theme()
     root.update_idletasks()
     _dark_titlebar(root)
     try:

@@ -46,7 +46,9 @@ python dgpu_detective.py --hybrid       # 回混合模式（目标态入口，�
 
 ## 图形界面（GUI / exe）
 
-CustomTkinter 深色主题。源码运行需装界面层依赖（CLI 引擎仍是纯标准库）：
+CustomTkinter 深色界面，统一设计系统：Microsoft YaHei UI 全局字体、GitHub Dark
+系单色板、当前显示模式按钮实色点亮（态式切换按钮）、保护名单警示黄（红色只留给
+危险/故障）。源码运行需装界面层依赖（CLI 引擎仍是纯标准库）：
 
 ```powershell
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple customtkinter
@@ -64,9 +66,9 @@ pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefil
 - **exe 双击即请求管理员**（uac-admin 清单）——杀提权占用软件、切换省电都需要；
   切换编排原样复用命令行 `--eco` / `--direct` 代码，只是跑在内嵌控制台里
 - 持有者表格 = `--report`/`--watch` 常驻版：自动刷新（间隔可调）、新持有黄底高亮、
-  右键菜单（结束进程树 / 结束全部同名 / 复制 PID / 打开文件位置），保护名单标红不杀；
+  右键菜单（结束进程树 / 结束全部同名 / 复制 PID / 打开文件位置），保护名单警示黄不杀；
   显卡列表每轮随采样重新枚举——切换显示模式后适配器消失/重现（LUID 变化）不失配，
-  概要条同步撤掉已消失的适配器
+  顶部横条面板同步撤掉已消失的适配器（显存占用条实时更新）
 - 底部徽章 = `--status` 四态凭证实时显示（内屏路由 / PnP problem / DXGI / GCU 意图），
   附能力角标（代际 + 直连/省电能力位，启动时后台探测一次）
 - 「独显直连 / 混合模式 / 核显省电」按钮 = 内嵌控制台运行完整切换编排，
