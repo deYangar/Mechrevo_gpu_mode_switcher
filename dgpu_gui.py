@@ -1,9 +1,12 @@
 """独显占用侦探 —— 图形界面版（单文件，纯标准库，复用 dgpu_detective 引擎）。
 
 - 持有者表格 = --report/--watch 的常驻版：自动刷新，新持有黄底高亮
-- 显示模式徽章 = --status 三态凭证（PnP problem / DXGI / GCU 注册表）
-- 「核显省电 / 恢复混合」= 内嵌控制台原样运行 cmd_eco_on / cmd_eco_off：
-  print 重定向进日志面板（双写 logs/eco_*.txt 留档），ask() 的 input() 弹问答框应答，
+- 显示模式徽章 = --status 四态凭证（内屏路由 / PnP problem / DXGI / GCU 意图回报），
+  附能力角标（代际 + 直连/省电能力位，启动后台探测一次）
+- 「核显省电 / 恢复混合 / 独显直连 / 直连回混合」= 内嵌控制台原样运行
+  cmd_eco_on / cmd_eco_off / cmd_direct_on / cmd_direct_off：
+  print 重定向进日志面板（双写 logs/eco_*.txt、logs/direct_*.txt 留档），
+  ask() 的 input() 弹问答框应答（重启三选默认安全侧），
   编排代码零改动——CLI 双向真测过的路径就是 GUI 跑的路径
 - 驱动层持有者（NVAPI/NVML 口径，补 WDDM 盲区）合并进主表格：后台线程自动扫，
   WDDM 已有的行补「NV 模块」列，WDDM 抓不到的（HWiNFO 等无图形上下文者）追加行
@@ -73,6 +76,8 @@ MODE_COLORS = {  # 徽章配色：fg, bg
     "hybrid": ("#1a6b2f", "#e0f2e2"),
     "igpu_only": ("#1a4fa0", "#e2ecfa"),
     "pnp_disabled": ("#8a5200", "#fbeed8"),
+    "dgpu_direct": ("#5b2a86", "#efe6fa"),
+    "direct_pending": ("#a05a00", "#fdf0d5"),
     "unknown": ("#9c1f1f", "#fae2e2"),
 }
 
@@ -144,13 +149,15 @@ class App:
     def __init__(self, root: tk.Tk, adapters: list):
         self.root = root
         root.title("独显占用侦探")
-        root.geometry("1040x700")
-        root.minsize(860, 560)
+        # 1180 起：四切换按钮（核显省电/恢复混合/独显直连/直连回混合）在工具栏
+        # 单行全部可见（1040 下末键被裁出可视区，2026-11-17 exe 截图实测）
+        root.geometry("1180x720")
+        root.minsize(1000, 560)
         self._autorun_done = False    # DGPU_TEST_AUTORUN 钩子只触发一次
         self._autorun_dumped = False  # DGPU_TEST_DUMP 钩子只写一次
 
         # ---- 跨线程状态（工作线程与主线程各管各的写方向，GIL 下安全）----
-        self.q = queue.Queue()      # 工作线程 -> 主线程：snap/err/ask/ecodone/nvtab
+        self.q = queue.Queue()      # 工作线程 -> 主线程：snap/err/ask/ecodone/nvtab/gcuinfo/gcu_intent
         self.nv_rows = []           # 最近一轮驱动层扫描 [(pid, name, mods)]，主线程渲染用
         self._nv_req = True         # 立即扫一轮标志（启动即扫；手动刷新/切换结束置位）
         self._nv_due = 0.0          # 下次自动扫描的时刻（monotonic）
@@ -158,14 +165,17 @@ class App:
         self.stop_evt = threading.Event()
         self.adapters = adapters
         self._auto = True
-        self._paused = False        # eco 切换期间暂停采样（PDH 句柄不跨线程并发）
+        self._paused = False        # 切换编排期间暂停采样（PDH 句柄不跨线程并发）
         self._manual_req = False
         self._include_all = False
         self._interval = 1.0
-        self.eco_running = False
+        self.switch_running = False  # 切换编排（eco/direct 任一）进行中
         self.last_data = None
         self.last_st = None
-        self._sink = None           # 当前 eco worker 的日志 sink（问答框读 pending）
+        self._sink = None           # 当前切换 worker 的日志 sink（问答框读 pending）
+        self.gcu_info = None        # 启动后台探测的 GcuInfo（能力角标 + 按钮启用）
+        self._gcu_direct_cache = ""  # 最近一次 GCU 意图回报（凭证 B 缓存，注入每轮快照）
+        self._gcu_igpu_cache = ""
 
         self.ask_bridge = _AskBridge(self.q)
 
@@ -181,6 +191,7 @@ class App:
         self.sampler.start()
         self.nv_scanner = threading.Thread(target=self._nv_loop, daemon=True)
         self.nv_scanner.start()
+        threading.Thread(target=self._gcu_probe_once, daemon=True).start()
         self.root.after(self.POLL_MS, self._poll)
 
     # ------------------------------------------------------------- UI 构建
@@ -213,10 +224,18 @@ class App:
         ttk.Button(bar, text="导出 JSON", command=self._export_json).pack(side="left", padx=6)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        self.eco_on_btn = ttk.Button(bar, text="核显省电", command=lambda: self.run_eco("on"))
+        self.eco_on_btn = ttk.Button(bar, text="核显省电",
+                                     command=lambda: self.run_switch("on"))
         self.eco_on_btn.pack(side="left")
-        self.eco_off_btn = ttk.Button(bar, text="恢复混合", command=lambda: self.run_eco("off"))
+        self.eco_off_btn = ttk.Button(bar, text="恢复混合",
+                                      command=lambda: self.run_switch("off"))
         self.eco_off_btn.pack(side="left", padx=6)
+        self.direct_on_btn = ttk.Button(bar, text="独显直连",
+                                        command=lambda: self.run_switch("direct_on"))
+        self.direct_on_btn.pack(side="left")
+        self.direct_off_btn = ttk.Button(bar, text="直连回混合",
+                                         command=lambda: self.run_switch("direct_off"))
+        self.direct_off_btn.pack(side="left", padx=6)
 
         # 中央：上持有者表格 / 下 Notebook，可拖分界
         pw = ttk.PanedWindow(self.root, orient="vertical")
@@ -366,10 +385,36 @@ class App:
                     self._on_ecodone(rest[0], rest[1])
                 elif kind == "nvtab":
                     self._apply_nvtab(rest[0])
+                elif kind == "gcuinfo":
+                    self.gcu_info = rest[0]
+                    self._update_switch_buttons()
+                elif kind == "gcu_intent":
+                    self._gcu_direct_cache, self._gcu_igpu_cache = rest[0], rest[1]
+                    if self.last_st is not None:
+                        self._apply_status(self.last_st)  # 意图到了，重判四态
         except queue.Empty:
             pass
         self._drain_log()
         self.root.after(self.POLL_MS, self._poll)
+
+    def _gcu_probe_once(self):
+        """启动后台探测一次 GcuInfo（能力角标 + 按钮启用依据）。"""
+        co_init()  # 工作线程跑 DXGI 枚举（probe_gcu → enumerate_adapters）需要 COM
+        try:
+            info = eng.probe_gcu()
+        except Exception as e:
+            self.log_q.put(f"（GCU 探测失败：{e!r}）\n")
+            info = None
+        self.q.put(("gcuinfo", info))
+
+    def _refresh_gcu_intent(self):
+        """GETSTATUS 拉一次 GCU 意图回报（凭证 B）更新缓存；切换结束后调用。"""
+        probe = eng.DisplayModeState(problems=[], dxgi_names=[])
+        try:
+            eng.enrich_with_gcu_status(probe, listen_secs=2.5)
+        except Exception:
+            return
+        self.q.put(("gcu_intent", probe.gcu_direct_status, probe.gcu_igpu_status))
 
     # ------------------------------------------------------------- 快照渲染
 
@@ -504,9 +549,15 @@ class App:
         return self.chips[luid]
 
     def _apply_status(self, st):
+        # 注入最近一次 GCU 意图回报缓存（快照线程不查 MQTT——每秒轮询会互踢常驻客户端）
+        if not st.gcu_direct_status and self._gcu_direct_cache:
+            st.gcu_direct_status = self._gcu_direct_cache
+        if not st.gcu_igpu_status and self._gcu_igpu_cache:
+            st.gcu_igpu_status = self._gcu_igpu_cache
         mode = st.mode
         fg, bg = MODE_COLORS.get(mode, MODE_COLORS["unknown"])
         self.mode_badge.config(text=f" {eng.MODE_LABELS.get(mode, mode)} ", fg=fg, bg=bg)
+        panel = {"discrete": "内屏:独显", "integrated": "内屏:核显"}.get(st.panel, "内屏:未知")
         probs = "; ".join(eng.STATE_LABELS.get(p, p).split("（")[0] for _, p in st.problems)
         probs = f"PnP: {probs}" if probs else "PnP: 不可读"
         if st.dxgi_error:
@@ -516,7 +567,21 @@ class App:
         else:
             dxgi = "DXGI 不可见独显"
         intent = f"IGPUonly={st.igpu_only}" if st.igpu_only is not None else "IGPUonly=未写"
-        self.evidence.config(text=f"{probs}  ｜  {dxgi}  ｜  {intent}")
+        gcu_intent = ""
+        di = eng.resolve_direct_status(st.gcu_direct_status)
+        if di is not None:
+            gcu_intent = {2: "直连", 0: "核显", 1: "混合"}.get(di, "?")
+            gcu_intent = f"  ｜  GCU意图: {gcu_intent}"
+        caps = ""
+        i = self.gcu_info
+        if i is not None:
+            dcap = {True: "✓", False: "✗", None: "?"}.get(i.dgpu_direct, "?")
+            icap = {True: "✓", False: "✗", None: "?"}.get(i.igpu_only, "?")
+            caps = (f"  ｜  Gen{i.generation.removeprefix('gen') or '?'}"
+                    f" 直连{dcap} 省电{icap}")
+        self.evidence.config(text=f"{panel}  ｜  {probs}  ｜  {dxgi}  ｜  {intent}"
+                                  f"{gcu_intent}{caps}")
+        self._update_switch_buttons()
 
     # ------------------------------------------------------------- 表格交互
 
@@ -633,35 +698,63 @@ class App:
 
     # ------------------------------------------------------------- 切换编排（内嵌控制台）
 
-    def run_eco(self, target: str):
-        if self.eco_running:
+    def run_switch(self, target: str):
+        """target: on/off（核显省电方向）/ direct_on/direct_off（独显直连方向）。
+
+        direct 方向不杀进程不动 PnP（省电态串联的 cmd_eco_off 同样无需提权），
+        所以只有 eco on 要求管理员——与 CLI 口径一致。
+        """
+        if self.switch_running:
             return
         if target == "on" and not eng.is_admin():
-            # off（恢复混合）不杀进程不动 PnP，无需提权（与 CLI cmd_eco_off 口径一致）
             messagebox.showwarning(
                 "独显占用侦探",
                 "未以管理员运行：清场要杀以管理员运行的软件（HWiNFO 等），切不动。\n"
                 "exe 版自带 UAC 提权；源码运行请用管理员终端启动。")
             return
-        self.eco_running = True
+        self.switch_running = True
         self._paused = True  # PDH 句柄不与切换 worker 并发；nv 扫描同停
-        self.eco_on_btn.config(state="disabled")
-        self.eco_off_btn.config(state="disabled")
-        threading.Thread(target=self._eco_worker, args=(target,), daemon=True).start()
+        self._update_switch_buttons()
+        threading.Thread(target=self._switch_worker, args=(target,), daemon=True).start()
 
-    def _eco_worker(self, target: str):
+    def _switch_buttons(self) -> tuple:
+        return (self.eco_on_btn, self.eco_off_btn, self.direct_on_btn, self.direct_off_btn)
+
+    def _update_switch_buttons(self):
+        """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）。"""
+        if self.switch_running:
+            for b in self._switch_buttons():
+                b.config(state="disabled")
+            return
+        mode = self.last_st.mode if self.last_st else "unknown"
+        i = self.gcu_info
+        eco_ok = not (i and i.igpu_only is False)
+        direct_ok = not (i and i.dgpu_direct is False)
+        self.eco_on_btn.config(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
+        self.eco_off_btn.config(state="normal" if mode == "igpu_only" else "disabled")
+        self.direct_on_btn.config(
+            state="normal" if mode != "dgpu_direct" and direct_ok else "disabled")
+        self.direct_off_btn.config(
+            state="normal" if mode in ("dgpu_direct", "direct_pending") else "disabled")
+
+    def _switch_worker(self, target: str):
         co_init()
         try:
-            logf = open(eng.eco_log_path(), "w", encoding="utf-8",
-                        errors="replace", buffering=1)
+            logf = open(eng.eco_log_path("direct" if target.startswith("direct") else "eco"),
+                        "w", encoding="utf-8", errors="replace", buffering=1)
         except OSError as e:
             self.log_q.put(f"（日志文件创建失败，仅面板显示：{e}）\n")
             logf = None
         sink = _LogSink(self.log_q, logf)
         self._sink = sink
-        title = ("核显省电切换（检测 → 清场 → 官方同款命令 → 凭证验证）"
-                 if target == "on" else "显示模式切换：核显省电 → 混合模式")
-        sink.write(f"\n===== {title} {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        titles = {
+            "on": "核显省电切换（检测 → 清场 → 官方同款命令 → 凭证验证）",
+            "off": "显示模式切换：核显省电 → 混合模式",
+            "direct_on": "独显直连切换（探测 → 发令 → GCU 确认 → 重启三选）",
+            "direct_off": "直连回混合切换（探测 → 发令 → GCU 确认 → 重启三选）",
+        }
+        sink.write(f"\n===== {titles.get(target, target)} "
+                   f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         rc = -1
         try:
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink), \
@@ -672,8 +765,12 @@ class App:
                         rc = eng.cmd_eco_on(counters, list(self.adapters))
                     finally:
                         counters.close()
-                else:
+                elif target == "off":
                     rc = eng.cmd_eco_off(list(self.adapters))
+                elif target == "direct_on":
+                    rc = eng.cmd_direct_on()
+                else:
+                    rc = eng.cmd_direct_off()
         except Exception:
             sink.write(traceback.format_exc())
         finally:
@@ -683,13 +780,14 @@ class App:
             self.q.put(("ecodone", target, rc))
 
     def _on_ecodone(self, _target, rc):
-        self.eco_running = False
+        self.switch_running = False
         self._paused = False
         self._manual_req = True
         self._nv_req = True
-        self.eco_on_btn.config(state="normal")
-        self.eco_off_btn.config(state="normal")
+        self._update_switch_buttons()
         self.log_q.put(f"\n（切换编排结束，返回码 {rc}）\n")
+        # 切换后 GCU 意图可能已翻转（直连待重启态判定依据），拉一次凭证 B
+        threading.Thread(target=self._refresh_gcu_intent, daemon=True).start()
 
     def _show_ask(self, bridge: _AskBridge):
         prompt = (self._sink.pending if self._sink else "").strip() or "（控制台提问，详见日志）"
@@ -700,7 +798,9 @@ class App:
         ttk.Label(win, text=prompt, wraplength=540, padding=14).pack()
         entry = ttk.Entry(win, width=30)
         entry.pack(padx=14, pady=(0, 8))
-        entry.insert(0, "1")
+        # 重启三选的 GUI 默认应答取安全侧（2=稍后自行重启）——一键回车不触发立即重启；
+        # 清场确认等其余问答仍默认 1
+        entry.insert(0, "2" if "立即重启" in prompt else "1")
         entry.select_range(0, "end")
 
         def answer(v: str):
@@ -739,11 +839,12 @@ class App:
         self.nv_rows = rows
         if self.last_data:
             self._render_table()  # 自动刷新关闭时也立即并入表格
-        # 后台自测钩子（DGPU_TEST_DUMP=路径）：nv 首轮到达后再等一轮采样合并，
-        # dump 表格实渲染内容（PrintWindow 抓不到屏幕外 Treeview 内容，像素验证不了）
+        # 后台自测钩子（DGPU_TEST_DUMP=路径）：nv 首轮到达后 10s 再 dump——
+        # GCU 探测（MQTT ~5s）须已到位，早期快照会把 gcu_info 误读成 None
+        #（PrintWindow 抓不到屏幕外 Treeview 内容，像素验证不了，只能 dump）
         if not self._autorun_dumped and os.environ.get("DGPU_TEST_DUMP"):
             self._autorun_dumped = True
-            self.root.after(1600, self._dump_tree)
+            self.root.after(10000, self._dump_tree)
 
     def _dump_tree(self):
         path = os.environ["DGPU_TEST_DUMP"]
@@ -758,6 +859,12 @@ class App:
         lines.append(f"detail: w={self.detail.winfo_width()} "
                      f"wraplength={self.detail.cget('wraplength')} "
                      f"tree_w={self.tree.winfo_width()}")
+        # 切换编排状态（通用化自测）：GCU 探测与四按钮态
+        gi = self.gcu_info
+        lines.append(f"gcu_info: {None if gi is None else (gi.connected, gi.generation, gi.client_id, gi.igpu_only, gi.dgpu_direct)}")
+        lines.append("buttons: " + ",".join(
+            f"{str(b.cget('text'))}={b.state()}" for b in self._switch_buttons()))
+        lines.append(f"badge: {self.mode_badge.cget('text')!r} evidence: {self.evidence.cget('text')!r}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
@@ -793,7 +900,7 @@ class App:
     # ------------------------------------------------------------- 退出
 
     def _on_close(self):
-        if self.eco_running:
+        if self.switch_running:
             if not messagebox.askyesno(
                     "独显占用侦探",
                     "切换编排正在进行（详见切换日志），现在退出可能停在"

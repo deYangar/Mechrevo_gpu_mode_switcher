@@ -83,9 +83,10 @@ class Adapter:
     luid: int
     name: str
     vendor_id: int
-    dedicated_vram: int
-    shared_system: int
-    software: bool
+    device_id: int = 0   # PCI DeviceId（代际判定用，如 50 系 0x28xx）
+    dedicated_vram: int = 0
+    shared_system: int = 0
+    software: bool = False
 
     @property
     def vendor(self) -> str:
@@ -127,6 +128,7 @@ def enumerate_adapters() -> list[Adapter]:
                         luid=luid,
                         name=desc.Description,
                         vendor_id=desc.VendorId,
+                        device_id=desc.DeviceId,
                         dedicated_vram=desc.DedicatedVideoMemory,
                         shared_system=desc.SharedSystemMemory,
                         software=bool(desc.Flags & 2),
@@ -472,13 +474,22 @@ def watch(counters: GpuCounters, adapters_meta: list[Adapter], interval: float) 
 
 
 # ---------------------------------------------------------------------------
-# 显示模式状态检测：PnP problem code 主判据 + DXGI 可见性 + GCU 注册表辅证
+# 显示模式状态检测（四态判据）：内屏路由 + PnP problem code + DXGI + GCU 意图回报
 # ---------------------------------------------------------------------------
 # 2026-11-11 实测定案：官方「核显省电」成功 = EC 级断开（problem=45，设备从 PCI 层
 # 消失、DXGI 枚举不到）；而 gpu_switch 的 PnP 软禁用 = problem=22，设备仍焊在总线上，
-# 是假切换。三态判据由此而来。
+# 是假切换。
+# 通用化改造（2026-11-17，docs/通用化改造方案.md §2.6）新增凭证 A「内屏路由探测」：
+# 直连态的本机权威判据——内屏 target 挂的适配器是独显（VEN_10DE）即直连；
+# 凭证 B「GCU 意图回报」与之不一致 → direct_pending（发令后、重启前的待重启态）。
 
-IGPUONLY_REG = (r"SOFTWARE\OEM\GamingCenter2\MySetting", "IGPUonly")
+# GCU MySetting 注册表三根（L-Mechrevo MechrevoDeviceCapabilities.cs 实录，
+# 首见值优先依次尝试：GCU 新根 → 旧控制台根 → ControlCenter 根）
+MYSETTING_PATHS = (
+    r"SOFTWARE\OEM\GamingCenter2\MySetting",
+    r"SOFTWARE\OEM\GamingCenter\MySetting",
+    r"SOFTWARE\OEM\ControlCenter\MySetting",
+)
 
 # Display 设备类 GUID；本机注册表 serial 键下只有 ClassGUID 没有 Class 值
 DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
@@ -496,8 +507,151 @@ MODE_LABELS = {
     "igpu_only": "核显省电（EC 级断开，官方真切换）",
     "pnp_disabled": "PnP 软禁用（设备仍在总线上——假切换残留）",
     "hybrid": "混合模式（独显在线）",
+    "dgpu_direct": "独显直连（内屏由独显驱动）",
+    "direct_pending": "直连切换待重启（GCU 已收到指令，重启后生效）",
     "unknown": "无法判定",
 }
+
+# --- 内屏路由探测：QueryDisplayConfig（user32）+ GET_ADAPTER_NAME ---
+# L-Mechrevo GpuRouteProbe.cs / DisplayNative.cs 移植，纯标准库 ctypes 复刻。
+_QDC_ALL_PATHS = 0x1
+_DEVINFO_GET_ADAPTER_NAME = 0x4
+# 内接输出形态（GpuRouteInference.IsInternalOutput 实录）
+_INTERNAL_OUTPUT_TECH = frozenset({
+    0x80000000,  # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+    0x6,         # LVDS
+    0xB,         # DISPLAYPORT_EMBEDDED
+    0xD,         # UDI_EMBEDDED
+})
+
+
+class _DC_LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _DC_RATIONAL(ctypes.Structure):
+    _fields_ = [("Numerator", wintypes.UINT), ("Denominator", wintypes.UINT)]
+
+
+class _DC_PATH_SOURCE_INFO(ctypes.Structure):
+    _fields_ = [("adapterId", _DC_LUID), ("id", wintypes.UINT),
+                ("modeInfoIdx", wintypes.UINT), ("statusFlags", wintypes.UINT)]
+
+
+class _DC_PATH_TARGET_INFO(ctypes.Structure):
+    _fields_ = [("adapterId", _DC_LUID), ("id", wintypes.UINT),
+                ("modeInfoIdx", wintypes.UINT), ("outputTechnology", wintypes.UINT),
+                ("rotation", wintypes.UINT), ("scaling", wintypes.UINT),
+                ("refreshRate", _DC_RATIONAL), ("scanLineOrdering", wintypes.UINT),
+                ("targetAvailable", wintypes.BOOL), ("statusFlags", wintypes.UINT)]
+
+
+class _DC_PATH_INFO(ctypes.Structure):
+    _fields_ = [("sourceInfo", _DC_PATH_SOURCE_INFO),
+                ("targetInfo", _DC_PATH_TARGET_INFO), ("flags", wintypes.UINT)]
+
+
+class _DC_MODE_INFO(ctypes.Structure):
+    # modeInfo union 只当 QueryDisplayConfig 的输出缓冲占位，内容不读
+    # （union 实际大小 = DISPLAYCONFIG_TARGET_MODE 的 48 字节）
+    _fields_ = [("infoType", wintypes.UINT), ("id", wintypes.UINT),
+                ("adapterId", _DC_LUID), ("_modeInfo", ctypes.c_byte * 48)]
+
+
+class _DC_DEVICE_INFO_HEADER(ctypes.Structure):
+    _fields_ = [("type", wintypes.UINT), ("size", wintypes.UINT),
+                ("adapterId", _DC_LUID), ("id", wintypes.UINT)]
+
+
+class _DC_ADAPTER_NAME(ctypes.Structure):
+    _fields_ = [("header", _DC_DEVICE_INFO_HEADER),
+                ("adapterDevicePath", ctypes.c_wchar * 128)]
+
+
+_user32 = None
+
+
+def _load_user32():
+    """user32 惰性单例（同 _load_pdh/_load_cfgmgr32 的模式）。"""
+    global _user32
+    if _user32 is None:
+        u = ctypes.WinDLL("user32")
+        u.GetDisplayConfigBufferSizes.argtypes = [
+            wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)]
+        u.GetDisplayConfigBufferSizes.restype = wintypes.LONG
+        u.QueryDisplayConfig.argtypes = [
+            wintypes.UINT, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(_DC_PATH_INFO),
+            ctypes.POINTER(wintypes.UINT), ctypes.POINTER(_DC_MODE_INFO), ctypes.c_void_p]
+        u.QueryDisplayConfig.restype = wintypes.LONG
+        u.DisplayConfigGetDeviceInfo.argtypes = [ctypes.POINTER(_DC_ADAPTER_NAME)]
+        u.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
+        _user32 = u
+    return _user32
+
+
+def _classify_adapter_path(device_path: str) -> str:
+    """适配器设备路径 → discrete/integrated/unknown（GpuRouteInference 同款）。"""
+    p = device_path.upper()
+    if "VEN_10DE" in p:
+        return "discrete"
+    if "VEN_8086" in p or "VEN_1002" in p:
+        return "integrated"
+    return "unknown"
+
+
+def internal_panel_route() -> tuple[str, list[str]]:
+    """内屏挂在哪块 GPU（凭证 A，直连态的本机权威判据）。
+
+    QueryDisplayConfig(QDC_ALL_PATHS) 枚举显示路径 → 过滤 targetAvailable 且
+    内接形态的 target → GET_ADAPTER_NAME 拿适配器设备路径 → 按 VEN 判独显/核显。
+    返回 (discrete/integrated/unknown, 内屏适配器设备路径列表)。
+    多内屏挂不同卡 → unknown（GpuRouteProbe 同款：矛盾即不可判定）。
+    """
+    paths_out: list[str] = []
+    u = _load_user32()
+    try:
+        for _attempt in range(3):  # ERROR_INSUFFICIENT_BUFFER(122) 重试，L-Mechrevo 同款
+            n_path, n_mode = wintypes.UINT(0), wintypes.UINT(0)
+            if u.GetDisplayConfigBufferSizes(_QDC_ALL_PATHS, ctypes.byref(n_path),
+                                             ctypes.byref(n_mode)) != 0:
+                return "unknown", paths_out
+            paths = (_DC_PATH_INFO * n_path.value)()
+            modes = (_DC_MODE_INFO * n_mode.value)()
+            rc = u.QueryDisplayConfig(_QDC_ALL_PATHS, ctypes.byref(n_path), paths,
+                                      ctypes.byref(n_mode), modes, None)
+            if rc == 122:
+                continue  # 显示路径在枚举间隙变了，重取大小再来
+            if rc != 0:
+                return "unknown", paths_out
+            result = "unknown"
+            seen: set[tuple[int, int, int]] = set()
+            for i in range(n_path.value):
+                t = paths[i].targetInfo
+                if not t.targetAvailable or t.outputTechnology not in _INTERNAL_OUTPUT_TECH:
+                    continue
+                key = (t.adapterId.LowPart, t.adapterId.HighPart, t.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                an = _DC_ADAPTER_NAME()
+                an.header.type = _DEVINFO_GET_ADAPTER_NAME
+                an.header.size = ctypes.sizeof(_DC_ADAPTER_NAME)
+                an.header.adapterId = t.adapterId
+                an.header.id = 0
+                if u.DisplayConfigGetDeviceInfo(ctypes.byref(an)) != 0:
+                    continue
+                paths_out.append(an.adapterDevicePath)
+                kind = _classify_adapter_path(an.adapterDevicePath)
+                if kind == "unknown":
+                    continue
+                if result == "unknown":
+                    result = kind
+                elif result != kind:
+                    return "unknown", paths_out
+            return result, paths_out
+    except Exception:
+        return "unknown", paths_out
+    return "unknown", paths_out
 
 
 _cfgmgr32 = None
@@ -595,14 +749,56 @@ def nvidia_pnp_states() -> list[tuple[str, str]]:
 
 
 def _read_igpuonly() -> int | None:
-    """GCU 亲手写的模式意图位（切换成功时 GCU 会更新它）。"""
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, IGPUONLY_REG[0], 0,
-                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
-            v, _ = winreg.QueryValueEx(k, IGPUONLY_REG[1])
-            return int(v)
-    except OSError:
+    """GCU 亲手写的模式意图位（切换成功时 GCU 会更新它）。
+
+    三根回退（方案 §2.2）：GamingCenter2 → GamingCenter → ControlCenter，
+    每根 Registry64/Registry32 双视图，首见值优先。
+    """
+    for root in MYSETTING_PATHS:
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0,
+                                    winreg.KEY_READ | view) as k:
+                    v, _ = winreg.QueryValueEx(k, "IGPUonly")
+                    return int(v)
+            except OSError:
+                continue
+    return None
+
+
+# GCU 意图回报的状态字段别名族（MechrevoHw.cs FirstField 实录）
+DIRECT_STATUS_KEYS = ("DiscreteGpuDirectConnectionSwitch_Status",
+                      "DGpuDirectConnectionSwitch_Status", "DGPU_DIRECT_STATUS")
+IGPU_STATUS_KEYS = ("IGpuOnlyConnectionSwitch_Status",
+                    "IGPUOnlyConnectionSwitch_Status", "IGPU_ONLY_STATUS")
+
+
+def resolve_direct_status(direct_status: str) -> int | None:
+    """直连状态字符串 → GpuMode（ResolveGpuModeStatus 移植）：2=直连 0=核显 1=混合。"""
+    s = (direct_status or "").upper()
+    if not s:
         return None
+    if "DIRECT_CONNECT_TOGGLE_ON" in s or "DIRECT_CONNECT_ON" in s or "DIRECT_CONNECTION_ON" in s:
+        return 2
+    if "DIRECT_CONNECT_TOGGLE_IGPU" in s or "DIRECT_CONNECT_IGPU" in s:
+        return 0
+    if "DIRECT_CONNECT_TOGGLE_OFF" in s or "DIRECT_CONNECT_OFF" in s or "DIRECT_CONNECTION_OFF" in s:
+        return 1
+    return None
+
+
+def resolve_igpu_status(igpu_status: str) -> int | None:
+    """核显省电状态字符串 → 模式（ResolveIgpuOnlySaveMode 移植）：0=省电 3=自动 1=混合。"""
+    s = (igpu_status or "").upper()
+    if not s:
+        return None
+    if "IGPU_ONLY_CONNECT_RB_ON" in s or "IGPU_ONLY_ON" in s:
+        return 0
+    if "IGPU_ONLY_CONNECT_RB_AUTO" in s or "IGPU_ONLY_AUTO" in s:
+        return 3
+    if "IGPU_ONLY_CONNECT_RB_OFF" in s or "IGPU_ONLY_OFF" in s:
+        return 1
+    return None
 
 
 @dataclass
@@ -611,10 +807,34 @@ class DisplayModeState:
     dxgi_names: list[str]
     dxgi_error: str = ""
     igpu_only: int | None = None
+    panel: str = "unknown"                 # 凭证 A：内屏路由 discrete/integrated/unknown
+    panel_paths: list[str] = field(default_factory=list)
+    gcu_direct_status: str = ""            # 凭证 B：GCU 意图回报原文（enrich 填充）
+    gcu_igpu_status: str = ""
 
     @property
-    def mode(self) -> str:
+    def gcu_intent(self) -> int | None:
+        """GCU 意图回报解析出的 GpuMode（2=直连 0=核显 1=混合）；无回报 None。"""
+        intent = resolve_direct_status(self.gcu_direct_status)
+        if intent is None:
+            intent = resolve_igpu_status(self.gcu_igpu_status)
+        return intent
+
+    @property
+    def base_mode(self) -> str:
+        """凭证 A 口径的实况模式（不含 GCU 意图比对）。"""
         ps = [p for _, p in self.problems]
+        if self.panel == "discrete":
+            return "dgpu_direct"  # 内屏挂独显即直连（此时 NV PnP 必然在场）
+        if self.panel == "integrated":
+            if ps and all(p == "online" for p in ps):
+                return "hybrid"
+            if ps and all(p == "disabled" for p in ps):
+                return "pnp_disabled"
+            if ps and all(p in ("disconnected", "absent") for p in ps):
+                return "igpu_only"
+            return "unknown"
+        # 内屏路由不可判定（外接屏多路挂不同卡等）：回落纯 PnP 老三态，不猜直连
         if ps and all(p == "disconnected" for p in ps):
             return "igpu_only"
         if ps and all(p == "disabled" for p in ps):
@@ -622,6 +842,19 @@ class DisplayModeState:
         if ps and all(p == "online" for p in ps):
             return "hybrid"
         return "unknown"
+
+    @property
+    def mode(self) -> str:
+        base = self.base_mode
+        intent = self.gcu_intent
+        if intent is not None:
+            # 凭证 B 比对：仅直连方向记 pending——意图直连而实况未直连、
+            # 或实况直连而意图已退出直连（发令后、重启前只有 GCU 知道 pending）
+            if intent == 2 and base != "dgpu_direct":
+                return "direct_pending"
+            if intent in (0, 1) and base == "dgpu_direct":
+                return "direct_pending"
+        return base
 
 
 def read_display_mode_state() -> DisplayModeState:
@@ -632,13 +865,18 @@ def read_display_mode_state() -> DisplayModeState:
                       if a.vendor_id == VENDOR_NVIDIA and not a.software]
     except OSError as e:
         dxgi_error = str(e)
+    panel, panel_paths = internal_panel_route()
     return DisplayModeState(problems=nvidia_pnp_states(),
                             dxgi_names=dxgi_names, dxgi_error=dxgi_error,
-                            igpu_only=_read_igpuonly())
+                            igpu_only=_read_igpuonly(),
+                            panel=panel, panel_paths=panel_paths)
 
 
 def print_mode_state(st: DisplayModeState) -> None:
-    print(f"当前显示模式: {MODE_LABELS[st.mode]}")
+    print(f"当前显示模式: {MODE_LABELS.get(st.mode, st.mode)}")
+    panel_label = {"discrete": "独显（VEN_10DE）", "integrated": "核显（Intel/AMD）"}.get(
+        st.panel, "不可判定（外接屏多路挂不同卡等）")
+    print(f"  内屏路由: {panel_label}")
     for inst, p in st.problems:
         print(f"  PnP  {inst}  →  {STATE_LABELS.get(p, p)}")
     if st.dxgi_error:
@@ -650,6 +888,9 @@ def print_mode_state(st: DisplayModeState) -> None:
     if st.igpu_only is not None:
         intent = "核显省电意图" if st.igpu_only else "混合模式意图"
         print(f"  GCU 注册表 IGPUonly = {st.igpu_only}（{intent}）")
+    if st.gcu_direct_status or st.gcu_igpu_status:
+        print(f"  GCU 意图回报: 直连={st.gcu_direct_status or '—'}"
+              f"  核显省电={st.gcu_igpu_status or '—'}")
 
 
 # === GCU 控制通道段（MQTT，与官方控制中心同路线）===
@@ -657,13 +898,22 @@ def print_mode_state(st: DisplayModeState) -> None:
 #   → GCUService 执行（判据检查 / NV 服务联动 / EC 写入 / 超时回滚全套官方逻辑）。
 # 本段向 Setting/Control 发布与控制中心点击完全相同的命令 = 同路线程序化触发。
 # 凭据与 clientId 白名单来自 L-Mechrevo 反编译源码 + 2026-11-11 实测
-# （UWPClient_3 已被 broker 拒绝，UWPClient_4 可用；同 id 互踢，占用窗口仅数秒）。
+# （UWPClient_3 曾被 broker 拒绝、UWPClient_4 可用；同 id 互踢，占用窗口仅数秒）。
+# 通用化改造（方案 §2.1）：clientId 槽位回退链 _4 → _3 → _2，CONNACK 被拒换下一槽，
+# 三槽全被拒才报「通道不可用」（one-shot 短连接无需 L-Mechrevo 的「恢复首选」逻辑）。
 GCU_MQTT_HOST, GCU_MQTT_PORT = "127.0.0.1", 13688
-GCU_MQTT_USER = "UWPClient_User_4"
-GCU_MQTT_PASS = "UWPClient_Pwd888881772688_4"
-GCU_MQTT_CLIENT_ID = "UWPClient_4"
+GCU_MQTT_SLOTS = (  # (clientId, user, pass)，与 MechrevoHw.cs 凭据常量一一对应
+    ("UWPClient_4", "UWPClient_User_4", "UWPClient_Pwd888881772688_4"),
+    ("UWPClient_3", "UWPClient_User_3", "UWPClient_Pwd888881772688_3"),
+    ("UWPClient_2", "UWPClient_User_2", "UWPClient_Pwd888881772688_2"),
+)
 GCU_ECO_ON_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_ON", "SetToWMIEC": "OK"}'
 GCU_ECO_OFF_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_OFF", "SetToWMIEC": "OK"}'
+# 直连命令（方案 §2.4 V1 定案）：纯 Action 报文，不带 SetToWMIEC
+GCU_DIRECT_ON_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_ON"}'
+GCU_DIRECT_OFF_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_OFF"}'
+GCU_DIRECT_RESTART_CMD = '{"Action": "DGPU_DIRECT_CONNECT_RESTART"}'
+GCU_GETSTATUS_CMD = '{"Action": "GETSTATUS"}'
 
 
 def _mqtt_enc_len(n: int) -> bytes:
@@ -722,37 +972,69 @@ def _mqtt_parse_publish(flags: int, body: bytes) -> tuple[str, str]:
     return topic, body[pos:].decode("utf-8", "replace")
 
 
+def _mqtt_connect_slot() -> tuple[socket.socket | None, str]:
+    """槽位回退链连接（方案 §2.1）：_4 → _3 → _2，CONNACK 被拒换下一槽。
+
+    返回 (sock, 错误描述)；sock 非 None 即连上（槽位记在 GCU_LAST_CLIENT_ID）。
+    MQTT 规范：CONNACK 拒绝后服务端已关连接——换槽必须重建 socket。
+    """
+    global GCU_LAST_CLIENT_ID
+    rejected: list[str] = []
+    for client_id, user, pwd in GCU_MQTT_SLOTS:
+        try:
+            sock = socket.create_connection((GCU_MQTT_HOST, GCU_MQTT_PORT), timeout=5)
+        except OSError as e:
+            return None, (f"无法连接 {GCU_MQTT_HOST}:{GCU_MQTT_PORT}（{e}）——"
+                          "GCUBridge 未运行？")
+        try:
+            sock.settimeout(1.0)
+            sock.sendall(_mqtt_packet(
+                _mqtt_str("MQTT") + bytes([4, 0xC2]) + struct.pack(">H", 30) +
+                _mqtt_str(client_id) + _mqtt_str(user) +
+                _mqtt_str(pwd), 1))
+            rc = -1
+            while True:
+                p = _mqtt_read_packet(sock)
+                if p is None:
+                    break  # broker 断开：本槽失败，换下一槽
+                ptype, _, body = p
+                if ptype == 2:  # CONNACK
+                    rc = body[1] if len(body) > 1 else -1
+                    break
+            if rc == 0:
+                GCU_LAST_CLIENT_ID = client_id
+                return sock, ""
+            rejected.append(f"{client_id}(rc={rc})")
+        except OSError:
+            rejected.append(f"{client_id}(连接中断)")
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return None, ("broker 拒绝连接：三槽均被拒 [" + "、".join(rejected) +
+                  "]——官方控制中心/L-Mechrevo 可能占用全部槽位")
+
+
+GCU_LAST_CLIENT_ID = ""  # 最近一次成功连接的槽位（诊断展示用；one-shot 场景无并发）
+
+
 def gcu_mqtt_command(payload: str, listen_secs: float = 8.0,
                      stop_keys: tuple[str, ...] = ()
                      ) -> tuple[str, list[tuple[str, str]]]:
     """连 GCU 控制通道：订阅状态回报 → 发布命令到 Setting/Control → 收 listen_secs 秒。
 
     返回 (状态, [(topic, payload), ...])。状态 "ok" 或错误描述。
+    连接走槽位回退链（_mqtt_connect_slot，方案 §2.1）；失败形态分级：
+    连接失败 / 三槽全被拒在此返回，发送成功零回报由调用方判断 events 为空。
     stop_keys：任一回报 payload 含这些子串时立即结束收听——判据码已到手，等满
     listen_secs 是白等（2026-11-13 实测每次浪费 ~7s）。
     仅依赖标准库 socket/struct 手写 MQTT 3.1.1 最小客户端。
     """
     events: list[tuple[str, str]] = []
+    sock, err = _mqtt_connect_slot()
+    if sock is None:
+        return err, events
     try:
-        sock = socket.create_connection((GCU_MQTT_HOST, GCU_MQTT_PORT), timeout=5)
-    except OSError as e:
-        return f"无法连接 {GCU_MQTT_HOST}:{GCU_MQTT_PORT}（{e}）", events
-    try:
-        sock.settimeout(1.0)
-        sock.sendall(_mqtt_packet(
-            _mqtt_str("MQTT") + bytes([4, 0xC2]) + struct.pack(">H", 30) +
-            _mqtt_str(GCU_MQTT_CLIENT_ID) + _mqtt_str(GCU_MQTT_USER) +
-            _mqtt_str(GCU_MQTT_PASS), 1))
-        while True:
-            p = _mqtt_read_packet(sock)
-            if p is None:
-                return "broker 在等待 CONNACK 时断开", events
-            ptype, _, body = p
-            if ptype == 2:  # CONNACK
-                rc = body[1] if len(body) > 1 else -1
-                if rc != 0:
-                    return f"broker 拒绝连接（rc={rc}，2=clientId 被拒）", events
-                break
         for i, t in enumerate(("Setting/Status", "GPUDevice/Status"), start=1):
             sock.sendall(_mqtt_packet(
                 struct.pack(">H", i) + _mqtt_str(t) + bytes([0]), 8, flags=2))
@@ -774,7 +1056,67 @@ def gcu_mqtt_command(payload: str, listen_secs: float = 8.0,
                     break
         return "ok", events
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
+
+
+def merge_gcu_events(events: list[tuple[str, str]]) -> dict:
+    """把回报事件里的 JSON 字段合并成一个 dict（先到先留，与 L-Mechrevo 累积口径一致）。"""
+    raw: dict = {}
+    for _topic, payload in events:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            for k, v in data.items():
+                raw.setdefault(k, v)
+    return raw
+
+
+def first_field(data: dict, *names: str):
+    """别名族取第一个存在的字段值（键名忽略大小写，FirstField 移植）。"""
+    lowered = {k.lower(): v for k, v in data.items()} if data else {}
+    for name in names:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
+_FLEX_TRUE = {"OPEN", "TRUE", "YES", "Y", "ON", "ENABLE", "ENABLED",
+              "SUPPORT", "AVAILABLE", "SUPPORTED", "SUPPORTS"}
+_FLEX_FALSE = {"NONE", "OFF", "N", "NO", "CLOSED", "DISABLE", "UNSUPPORT",
+               "DISABLED", "CLOSE", "FALSE", "NONSUPPORT"}
+
+
+def parse_flexible_bool(v) -> bool | None:
+    """能力位值解析（ParseFlexibleBool 移植）：bool 直用；int !=0；字符串清洗后
+    匹配 true/yes/on/supported/enable/enabled 等词族；无法解析的字符串按 False。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return int(s) != 0
+    except ValueError:
+        pass
+    cleaned = re.sub(r"[ \-._]", "", s).upper()
+    if cleaned in _FLEX_TRUE:
+        return True
+    if cleaned in _FLEX_FALSE:
+        return False
+    return False
+
+
+def first_optional_bool(data: dict, *names: str) -> bool | None:
+    """别名族取第一个存在且可解析的 bool（FirstOptionalBool 移植）。"""
+    v = first_field(data, *names)
+    if v is None:
+        return None
+    return parse_flexible_bool(v)
 
 
 def print_gcu_events(events: list[tuple[str, str]]) -> None:
@@ -787,10 +1129,43 @@ def print_gcu_events(events: list[tuple[str, str]]) -> None:
         for key, label in (
                 ("CheckDGpuStatusforIGpuOnlyOnSuccess",
                  "GCU 判据码（1=判「显卡使用中」拒绝；2=判据通过）"),
+                ("CheckDGpuStatusforIGpuOnlySwitch",
+                 "GCU 判据码备用字段（85=通过；170=拒绝，新版 GCU 使用）"),
+                ("DiscreteGpuDirectConnectionSwitch_Status", "GCU 直连状态"),
                 ("IGpuOnlyConnectionSwitch_Status", "GCU 核显省电状态"),
                 ("currentSaveingMode", "GCU currentSaveingMode（不可信，仅参考）")):
             if key in data:
                 print(f"  GCU 回报 {topic}: {key} = {data[key]}（{label}）")
+
+
+def gcu_switch_result(events: list[tuple[str, str]]) -> int | None:
+    """判据码解析（GpuSwitchResult 移植，方案 §2.7 双字段）。
+
+    返回 1=判「显卡使用中」拒绝、2=判据通过、0=未知编码、None=无判据回报。
+    主字段 CheckDGpuStatusforIGpuOnlyOnSuccess 字符串 Contains（'1'→1、'2'→2）；
+    备用字段 CheckDGpuStatusforIGpuOnlySwitch 整数（85→2、170→1，新版 GCU）。
+    """
+    for _topic, payload in events:
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        v = first_field(data, "CheckDGpuStatusforIGpuOnlyOnSuccess")
+        if v is not None and str(v).strip():
+            s = str(v)
+            if "1" in s:
+                return 1
+            if "2" in s:
+                return 2
+            return 0
+        v2 = first_field(data, "CheckDGpuStatusforIGpuOnlySwitch")
+        if v2 is not None:
+            try:
+                n = int(str(v2).strip())
+            except ValueError:
+                continue
+            return 2 if n == 85 else (1 if n == 170 else 0)
+    return None
 
 
 def gcu_rejected(events: list[tuple[str, str]]) -> bool:
@@ -799,14 +1174,315 @@ def gcu_rejected(events: list[tuple[str, str]]) -> bool:
     判据在驱动层，回落比进程退出/WDDM 计数器滞后——2026-11-11 实测：
     清场复查（+2s）已干净，命令仍被判据码 1 拒绝；隔 ~10s 重发即成功。
     """
-    for _topic, payload in events:
-        try:
-            data = json.loads(payload)
-        except ValueError:
-            continue
-        if data.get("CheckDGpuStatusforIGpuOnlyOnSuccess") == 1:
+    return gcu_switch_result(events) == 1
+
+
+# ---------------------------------------------------------------------------
+# GCU 探测层（方案 §三 A）：代际判定 + 词表 + 在线回报/注册表能力 + --gcu-info
+# ---------------------------------------------------------------------------
+
+# dGPU 代际词表（DisplayRouteMatrix.cs 实录的 ConsoleActions 证据矩阵，方案 §1.3）
+GEN30_ACTIONS = frozenset({
+    "DGPU_DIRECT_CONNECT_TOGGLE_ON", "DGPU_DIRECT_CONNECT_TOGGLE_OFF"})
+GEN40_DUAL_ACTIONS = GEN30_ACTIONS | {
+    "DGPU_DIRECT_CONNECT_TOGGLE_IGPU", "DGPU_DIRECT_CONNECT_RESTART"}
+GEN40_TRI_ACTIONS = GEN40_DUAL_ACTIONS | {
+    "IGPU_ONLY_CONNECT_RB_ON", "IGPU_ONLY_CONNECT_RB_OFF"}
+GEN50_ACTIONS = GEN40_TRI_ACTIONS | {
+    "IGPU_ONLY_CONNECT_RB_AUTO", "DGPU_DIRECT_CONNECT_RESTART",
+    "GPU_HOTSWAP_ON", "GPU_HOTSWAP_OFF"}
+
+GEN_LABELS = {
+    "gen30": "30 系（Gen30：仅直连⇄混合两态，无重启命令）",
+    "gen40": "40 系（Gen40：三模/双模档由能力位细分）",
+    "gen50": "50 系（Gen50：词表全量，含热切换枚举）",
+    "no_dgpu": "无 NVIDIA 独显",
+    "unknown": "代际不可判定",
+}
+
+# 注册表能力位路径族（MechrevoDeviceCapabilities.cs 实录，方案 §2.2）：
+# ItemSupport 三根 + MySetting\GpuConfig 三根，首见值优先，双视图都读
+GCU_CAP_PATHS = (
+    r"SOFTWARE\OEM\GamingCenter2\ItemSupport",
+    r"SOFTWARE\OEM\GamingCenter\ItemSupport",
+    r"SOFTWARE\OEM\ControlCenter\ItemSupport",
+    r"SOFTWARE\OEM\GamingCenter2\MySetting\GpuConfig",
+    r"SOFTWARE\OEM\GamingCenter\MySetting\GpuConfig",
+    r"SOFTWARE\OEM\ControlCenter\MySetting\GpuConfig",
+)
+
+BIOS_IDENTITY_KEYS = ("SystemManufacturer", "SystemProductName", "SystemFamily",
+                      "SystemSKU", "BaseBoardManufacturer", "BaseBoardProduct", "BIOSVersion")
+
+
+def _gen_from_device_id(v: int) -> str | None:
+    """PCI DeviceId 数值 → 代际（FromDeviceId 高字节规则）。"""
+    hi = (v >> 8) & 0xFF
+    if 0x20 <= hi <= 0x25:
+        return "gen30"
+    if 0x26 <= hi <= 0x28:
+        return "gen40"
+    if 0x2B <= hi <= 0x30:
+        return "gen50"
+    return None
+
+
+def _generation_from_pnp_registry() -> tuple[str, str] | None:
+    r"""注册表 PnP 实例名推代际（省电态通道）。
+
+    省电态（EC 级断开）独显从 DXGI 图形栈消失，但注册表 Enum\PCI 的实例名
+    （含幻影设备）仍留着 VEN_10DE&DEV_XXXX——FromDeviceId 本就解析这种字符串，
+    从 DEV_ 推代际是同一规则，保证 eco off（省电→混合）不被误判 no_dgpu 挡住。
+    """
+    for inst, _state in nvidia_pnp_states():
+        m = re.search(r"DEV_([0-9A-Fa-f]{4})", inst)
+        if m:
+            gen = _gen_from_device_id(int(m[1], 16))
+            if gen:
+                return gen, f"注册表 PnP 实例 {inst}"
+    return None
+
+
+def detect_dgpu_generation(adapters: list[Adapter] | None = None) -> tuple[str, str]:
+    """dGPU 代际判定（DgpuGenerationProbe 移植，方案 §2.3）。
+
+    第一优先：显卡名正则 \\bRTX\\s*(\\d{4})\\b 取前两位；第二优先：PCI DeviceId
+    高字节（0x20–0x25→Gen30、0x26–0x28→Gen40、0x2B–0x30→Gen50）；
+    DXGI 无 NVIDIA（省电态 EC 断开属预期）时第三优先：注册表 PnP 实例名推代际。
+    返回 (gen30/gen40/gen50/no_dgpu/unknown, 判定依据描述)。
+    """
+    try:
+        adapters = enumerate_adapters() if adapters is None else adapters
+    except OSError:
+        reg = _generation_from_pnp_registry()
+        return (reg if reg else ("unknown", "DXGI 枚举不可用"))
+    nv = [a for a in adapters if a.vendor_id == VENDOR_NVIDIA and not a.software]
+    if not nv:
+        reg = _generation_from_pnp_registry()
+        if reg:
+            return reg
+        return "no_dgpu", "无 NVIDIA 适配器（DXGI 与注册表 PnP 均无）"
+    for a in nv:
+        m = re.search(r"\bRTX\s*(\d{4})\b", a.name, re.IGNORECASE)
+        if m:
+            gen = {"30": "gen30", "40": "gen40", "50": "gen50"}.get(m[1][:2])
+            if gen:
+                return gen, f"显卡名「{a.name}」"
+    for a in nv:
+        gen = _gen_from_device_id(a.device_id)
+        if gen:
+            return gen, f"PCI DeviceId 0x{a.device_id:04X}"
+    return "unknown", f"NVIDIA 适配器「{nv[0].name}」名字与 DeviceId 均未命中代际规则"
+
+
+def read_gcu_registry_caps() -> dict:
+    """注册表能力位（ItemSupport + GpuConfig 六路径 × 双视图，首见值优先 TryAdd）。"""
+    values: dict = {}
+    for path in GCU_CAP_PATHS:
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0,
+                                    winreg.KEY_READ | view) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name, v, _t = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        values.setdefault(name.lower(), v)
+            except OSError:
+                continue
+    return values
+
+
+def read_machine_identity() -> dict:
+    """机器身份（HARDWARE\\DESCRIPTION\\System\\BIOS，IsMechrevo 判定用）。"""
+    out: dict = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\BIOS", 0,
+                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            for key in BIOS_IDENTITY_KEYS:
+                try:
+                    out[key], _ = winreg.QueryValueEx(k, key)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def is_mechrevo_name(*names: str) -> bool:
+    """IsMechrevoName 移植：名字含 MECHREVO 或 MECH REV（带空格形态，忽略大小写）。"""
+    for n in names:
+        u = (n or "").upper()
+        if "MECHREVO" in u or "MECH REV" in u:
             return True
     return False
+
+
+@dataclass
+class GcuInfo:
+    connected: bool                 # MQTT GETSTATUS 是否拿到回报
+    connect_note: str               # 失败形态分级（连接失败/三槽全被拒/零回报）
+    generation: str                 # gen30/gen40/gen50/no_dgpu/unknown
+    gen_source: str                 # 代际判定依据
+    vocab: set[str]                 # 本机代际词表（词表外命令不发）
+    three_mode: bool | None         # Gen40 三模档判定（True/False/None=非 Gen40）
+    igpu_only: bool | None          # 核显省电能力（None = 探测不可得）
+    dgpu_direct: bool | None        # 独显直连能力
+    igpu_source: str                # 能力位来源（在线回报/注册表/不可得）
+    dgpu_source: str
+    hot_swap_note: str              # Gen50 热切换词表在但 GCU no-op，如实标注
+    is_mechrevo: bool | None        # 机器身份判定（None = 身份不可读）
+    identity: dict                  # BIOS 身份字段
+    direct_status: str              # GCU 意图回报原文
+    igpu_status: str
+    raw: dict                       # GETSTATUS 回报原始字段留档
+    client_id: str = ""             # 实际连上的槽位（回退链观测，R4）
+
+
+def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
+    """GCU 全量探测：代际 + 词表 + 能力（在线回报优先、注册表回落）+ 意图回报。
+
+    SupportsDgpuDirect 三级回落（方案 §2.7）：在线回报 → 注册表 → 不可得
+    （UEFI MUX 变量存在性一级不做，列为可选增强）。
+    SupportsIgpuOnly 以在线回报优先——Gen40 注册表位不可靠（HasReliableIgpuOnlyCapability）。
+    """
+    identity = read_machine_identity()
+    mech = (is_mechrevo_name(str(identity.get("SystemManufacturer", "")),
+                             str(identity.get("BaseBoardManufacturer", "")))
+            if identity else None)
+    try:
+        adapters = enumerate_adapters()
+        gen, gen_source = detect_dgpu_generation(adapters)
+    except OSError:
+        gen, gen_source = "unknown", "DXGI 枚举不可用"
+
+    status, events = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=listen_secs)
+    connected = status == "ok"
+    note = "在线" if connected else status
+    raw = merge_gcu_events(events) if connected else {}
+
+    direct_status = str(first_field(raw, *DIRECT_STATUS_KEYS) or "") if raw else ""
+    igpu_status = str(first_field(raw, *IGPU_STATUS_KEYS) or "") if raw else ""
+
+    # 能力位：在线回报优先（FirstOptionalBool 别名族）
+    dgpu_direct = first_optional_bool(
+        raw, "DiscreteGpuDirectConnectionSwitch_Support",
+        "DGpuDirectConnectionSwitch_Support", "DGPU_DIRECT_SUPPORT") if raw else None
+    igpu_only = first_optional_bool(
+        raw, "IGpuOnlyConnectionSwitch_Support",
+        "IGPUOnlyConnectionSwitch_Support", "IGPU_ONLY_SUPPORT") if raw else None
+    # 隐式能力：状态字段出现且被识别 → 能力位补 True（IsRecognized* 实录）
+    if dgpu_direct is None and resolve_direct_status(direct_status) is not None:
+        dgpu_direct = True
+    if igpu_only is None and resolve_igpu_status(igpu_status) is not None:
+        igpu_only = True
+    dgpu_source = "在线回报" if dgpu_direct is not None else ""
+    igpu_source = "在线回报" if igpu_only is not None else ""
+
+    # 回落：注册表能力位（三根双视图别名族）
+    reg = read_gcu_registry_caps()
+    if dgpu_direct is None:
+        dgpu_direct = parse_flexible_bool(first_field(
+            reg, "DGpuDirectConnectionSupport",
+            "DiscreteGpuDirectConnectionSupport", "MuxSwitchSupport"))
+        dgpu_source = "注册表" if dgpu_direct is not None else "不可得"
+    if igpu_only is None:
+        igpu_only = parse_flexible_bool(first_field(
+            reg, "iGPUModeOnlySupport", "IGpuOnlyModeSupport",
+            "IntegratedGpuOnlySupport", "IGpuOnlyConnectionSwitch_Support"))
+        igpu_source = "注册表" if igpu_only is not None else "不可得"
+
+    # Gen40 三模档判定：在线回报 iGPUModeOnlySupport 优先，回落注册表
+    #（TierFromCapability 实录：mqtt 有值用 mqtt，否则 persisted 候选）
+    three_mode = None
+    if gen == "gen40":
+        tri = first_optional_bool(raw, "iGPUModeOnlySupport") if raw else None
+        if tri is None:
+            tri = parse_flexible_bool(first_field(reg, "iGPUModeOnlySupport"))
+        three_mode = bool(tri) if tri is not None else False
+
+    if gen == "gen50":
+        vocab = set(GEN50_ACTIONS)
+    elif gen == "gen40":
+        vocab = set(GEN40_TRI_ACTIONS if three_mode else GEN40_DUAL_ACTIONS)
+    elif gen == "gen30":
+        vocab = set(GEN30_ACTIONS)
+    else:
+        vocab = set()  # 未知代际：词表为空 = 词表外命令一律不发（硬门禁）
+
+    hot_swap_note = ""
+    if "GPU_HOTSWAP_ON" in vocab:
+        hot_swap_note = ("词表含 GPU_HOTSWAP_ON/OFF，但 GCU 处理器为 log-only no-op"
+                         "（未证实可用）——不提供热切换路径，仅如实标注")
+
+    return GcuInfo(connected=connected, connect_note=note, generation=gen,
+                   gen_source=gen_source, vocab=vocab, three_mode=three_mode,
+                   igpu_only=igpu_only, dgpu_direct=dgpu_direct,
+                   igpu_source=igpu_source, dgpu_source=dgpu_source,
+                   hot_swap_note=hot_swap_note, is_mechrevo=mech,
+                   identity=identity, direct_status=direct_status,
+                   igpu_status=igpu_status, raw=raw,
+                   client_id=(GCU_LAST_CLIENT_ID if connected else ""))
+
+
+def print_gcu_info(info: GcuInfo) -> None:
+    """--gcu-info 诊断输出：探测结果全量打印（README 截图 / 真机反馈口径）。"""
+    print("=== GCU 探测结果 ===")
+    mech = {True: "是（机械革命 GCU 机型）", False: "否（不在通用化范围）",
+            None: "身份不可读"}[info.is_mechrevo]
+    print(f"机器身份: {mech}")
+    for k in BIOS_IDENTITY_KEYS:
+        if k in info.identity:
+            print(f"  {k} = {info.identity[k]}")
+    print(f"dGPU 代际: {GEN_LABELS.get(info.generation, info.generation)}（{info.gen_source}）")
+    tier = "" if info.three_mode is None else \
+        ("三模档（iGPUModeOnlySupport=1）" if info.three_mode else "双模档（无 IGPU_ONLY_*）")
+    if tier:
+        print(f"  Gen40 档位: {tier}")
+    print(f"本机词表（{len(info.vocab)} 条，词表外命令不发）:")
+    for a in sorted(info.vocab):
+        print(f"    {a}")
+    print(f"核显省电能力: {_cap_str(info.igpu_only)}（来源: {info.igpu_source}）")
+    print(f"独显直连能力: {_cap_str(info.dgpu_direct)}（来源: {info.dgpu_source}）")
+    if info.hot_swap_note:
+        print(f"热切换: {info.hot_swap_note}")
+    slot = f"（槽位 {info.client_id}）" if info.client_id else ""
+    print(f"GCU 通道: {info.connect_note}{slot}")
+    if info.connected:
+        if info.direct_status or info.igpu_status:
+            print(f"GCU 意图回报: 直连={info.direct_status or '—'}"
+                  f"  核显省电={info.igpu_status or '—'}")
+        if not info.raw:
+            print("（命令送达但零回报：listen 窗口内 Setting/Status 未出现数据）")
+        keys = [k for k in info.raw
+                if any(t in k.lower() for t in ("gpu", "display", "mode", "mux", "switch"))]
+        if keys:
+            print("回报原始字段（显示相关，留档核对）:")
+            for k in sorted(keys):
+                print(f"    {k} = {info.raw[k]}")
+
+
+def _cap_str(v: bool | None) -> str:
+    return {True: "支持 ✓", False: "不支持 ✗", None: "探测不可得"}[v]
+
+
+def enrich_with_gcu_status(st: DisplayModeState,
+                           listen_secs: float = 4.0) -> str:
+    """MQTT GETSTATUS 把 GCU 意图回报（凭证 B）填进 st；返回通道状态。
+
+    --status 与切换编排收尾用；GUI 常规采样不查（每秒轮询会互踢常驻客户端）。
+    """
+    status, events = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=listen_secs)
+    if status != "ok":
+        return status
+    raw = merge_gcu_events(events)
+    st.gcu_direct_status = str(first_field(raw, *DIRECT_STATUS_KEYS) or "")
+    st.gcu_igpu_status = str(first_field(raw, *IGPU_STATUS_KEYS) or "")
+    return "ok"
 
 
 def wait_for_mode(target: str, timeout_sec: float = 180.0,
@@ -843,6 +1519,9 @@ PROTECTED_PROCESSES = {
     # GCU 后台：MQTT 命令的接收与执行者（--eco 切换段依赖它），杀了断控制通道
     # （2026-11-11 实测被误列驱动层候选强杀，靠服务自愈才没断；NVAPI 模块口径对它必中）
     "gcuservice.exe", "gcubridge.exe", "ccuwinui.exe",
+    # GCU UI 家族（Install-Gcu.ps1 VendorProcessNames 实录，方案 §2.8）：
+    # 控制中心各代 UI 外壳与托盘组件，同属杀了自愈/断 UI 的通道组件
+    "controlcenteru.exe", "gamingcentercu.exe", "gcuui.exe", "systraycomponent.exe",
 }
 
 # NVIDIA 自家组件（PROTECTED_PROCESSES 的 NV 子集）：GCU 接到切换指令后联动停止的
@@ -1061,13 +1740,13 @@ class _Tee:
         self._f.close()
 
 
-def eco_log_path() -> str:
+def eco_log_path(prefix: str = "eco") -> str:
     # onefile 冻结后 __file__ 指向临时解压目录（退出即焚），日志必须落在 exe 旁
     base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
                            else os.path.abspath(__file__))
     d = os.path.join(base, "logs")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, time.strftime("eco_%Y%m%d_%H%M%S.txt"))
+    return os.path.join(d, time.strftime(f"{prefix}_%Y%m%d_%H%M%S.txt"))
 
 
 def proc_name(image: str) -> str:
@@ -1115,6 +1794,20 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
     if st.mode == "unknown":
         print("\n无法判定当前显示模式（PnP/DXGI 凭证异常，如上），不继续。")
         return 1
+
+    # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）：行为不变，仅头部插入
+    # ——30 系等无 IGPU_ONLY_* 词表的机型在这里如实退出，不再空试
+    info = probe_gcu()
+    if info.igpu_only is False:
+        print(f"\nX 本机不支持核显省电（能力位来源: {info.igpu_source}）。")
+        return 1
+    if "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+        print(f"\nX rejected: action not in dGPU generation {info.generation} vocabulary")
+        print(f"  本机词表不含 IGPU_ONLY_CONNECT_RB_ON"
+              f"（{GEN_LABELS.get(info.generation, info.generation)}）。")
+        return 1
+    if info.igpu_only is None:
+        print("\n! 核显省电能力探测不可得（GCU 离线且注册表无能力位），继续执行。")
 
     if not is_admin():
         print("\n关闭提权软件（HwMonitor/GamePP 等）需要管理员，提权继续…")
@@ -1308,8 +2001,21 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         print("\n已在混合模式（独显在线），无需切换。")
         return 0
     if st.mode != "igpu_only":
-        print(f"\n当前模式不是核显省电态（{MODE_LABELS[st.mode]}），本命令只负责省电态 → 混合。")
+        print(f"\n当前模式不是核显省电态（{MODE_LABELS.get(st.mode, st.mode)}），"
+              "本命令只负责省电态 → 混合。")
         return 1
+
+    # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）：行为不变，仅头部插入
+    info = probe_gcu()
+    if info.igpu_only is False:
+        print(f"\nX 本机不支持核显省电（能力位来源: {info.igpu_source}）。")
+        return 1
+    if "IGPU_ONLY_CONNECT_RB_OFF" not in info.vocab:
+        print(f"\nX rejected: action not in dGPU generation {info.generation} vocabulary")
+        print(f"  本机词表不含 IGPU_ONLY_CONNECT_RB_OFF"
+              f"（{GEN_LABELS.get(info.generation, info.generation)}）。")
+        return 1
+
     print("\n--- 发送切换命令（GCU 控制通道，与控制中心点击同路线）---")
     status, events = gcu_mqtt_command(
         GCU_ECO_OFF_CMD, listen_secs=8.0,
@@ -1335,6 +2041,226 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# 独显直连切换编排（--direct，方案 §三 E）：MUX 切换重启生效 + 待重启态
+# ---------------------------------------------------------------------------
+
+def wait_direct_status(token: str, rounds: int = 7,
+                       round_secs: float = 1.8) -> tuple[bool, str]:
+    """GETSTATUS 复查直连状态字段翻转（7×1.8s 超时上限与 L-Mechrevo 同款）。
+
+    token 为期望出现的状态子串（TOGGLE_ON / TOGGLE_OFF）；
+    stop_keys 节流与 eco 同款——状态字段一到就返回，不等满 listen 窗口。
+    """
+    cur = ""
+    for i in range(rounds):
+        status, events = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=round_secs,
+                                          stop_keys=DIRECT_STATUS_KEYS)
+        if status != "ok":
+            return False, f"GCU 控制通道不可用：{status}"
+        cur = str(first_field(merge_gcu_events(events), *DIRECT_STATUS_KEYS) or "")
+        if token in cur.upper():
+            return True, cur
+        print(f"  … 等待 GCU 确认（第 {i + 1}/{rounds} 轮，当前直连状态: {cur or '无回报'}）")
+    return False, cur
+
+
+def restart_countdown(seconds: int = 5) -> bool:
+    """RESTART 发送前的 5 秒可取消倒计时二次确认（CLI Ctrl+C 可中断）。"""
+    print(f"  {seconds} 秒后发送重启命令（Ctrl+C 取消）…")
+    try:
+        for i in range(seconds, 0, -1):
+            print(f"  {i} …", flush=True)
+            time.sleep(1.0)
+        return True
+    except KeyboardInterrupt:
+        print("  已取消发送重启命令（保持待重启态，重启后直连切换仍会生效）。")
+        return False
+
+
+def direct_restart_choice() -> str:
+    """重启三选（方案 §三 E 步骤 5）：
+
+    [1] 立即重启 = 发 DGPU_DIRECT_CONNECT_RESTART，GCU 自己执行 shutdown /r /t 0
+        （发之前 5 秒可取消倒计时二次确认）
+    [2] 稍后自行重启 = 保持待重启态，--status 显示 direct_pending
+    [回车] 取消重启安排 = 命令已发，如实说明当前处于待重启态
+    """
+    return ask("[1] 立即重启（5 秒可取消倒计时后由 GCU 执行重启）"
+               "  [2] 稍后自行重启（保持待重启态）"
+               "  [回车/其他] 取消重启安排（命令已发，同样处于待重启态）")
+
+
+def _direct_capability_gate(required_action: str) -> tuple[GcuInfo | None, int]:
+    """直连编排的能力/词表前置（cmd_direct_on/off 共用）。
+
+    返回 (GcuInfo, 0) 可继续；(None, 退出码) 已打印原因应退出。
+    """
+    info = probe_gcu()
+    if info.dgpu_direct is False:
+        print(f"\nX 本机不支持独显直连（能力位来源: {info.dgpu_source}）。")
+        print("  宝龙达 Uniwill 模具（蛟龙 30 系部分/WUJIE14XA/星耀/UMI）不在支持范围。")
+        return None, 1
+    if required_action not in info.vocab or \
+            "DGPU_DIRECT_CONNECT_RESTART" not in info.vocab:
+        missing = required_action if required_action not in info.vocab \
+            else "DGPU_DIRECT_CONNECT_RESTART"
+        print(f"\nX rejected: action not in dGPU generation {info.generation} vocabulary")
+        print(f"  本机词表不含 {missing}"
+              f"（{GEN_LABELS.get(info.generation, info.generation)}）——"
+              "30 系等无机种不发空命令。")
+        return None, 1
+    if info.dgpu_direct is None:
+        print("\n! 独显直连能力探测不可得（GCU 离线且注册表无能力位），继续执行但不保证 GCU 接受。")
+    return info, 0
+
+
+def cmd_direct_on() -> int:
+    """混合 → 独显直连（MUX 切换，重启生效；方案 §三 E cmd_direct_on）。
+
+    省电态下自动串联：先 IGPU_ONLY_CONNECT_RB_OFF（复用 cmd_eco_off 发令与
+    验证段）等独显回线，再继续直连——一次命令完成。
+    """
+    print("=== 独显直连切换编排（探测 → 发令 → GCU 确认 → 重启三选）===")
+    info, rc = _direct_capability_gate("DGPU_DIRECT_CONNECT_TOGGLE_ON")
+    if info is None:
+        return rc
+
+    st = read_display_mode_state()
+    enrich_with_gcu_status(st)  # 凭证 B：直连待重启态判定需要 GCU 意图
+    print_mode_state(st)
+    if st.mode == "dgpu_direct":
+        print("\n已在独显直连态（内屏由独显驱动），无需切换。")
+        return 0
+    if st.mode == "direct_pending" and st.gcu_intent == 2:
+        print("\n直连指令已生效待重启：重启后即切换为独显直连"
+              "（--status / GUI 徽章显示待重启态）。")
+        return 0
+    if st.mode in ("pnp_disabled", "unknown"):
+        print(f"\n当前显示模式不干净（{MODE_LABELS.get(st.mode, st.mode)}）。")
+        print("  请先恢复到干净的混合模式（--eco off，或设备管理器启用 NVIDIA 设备）再直连。")
+        return 1
+    if st.mode == "direct_pending":
+        print("\n检测到「退出直连」的待重启指令——重发直连命令，回到直连目标。")
+    if st.mode == "igpu_only":
+        print("\n当前为核显省电态：自动串联「恢复混合」等独显回线，再继续直连…")
+        try:
+            adapters = enumerate_adapters()
+        except OSError:
+            adapters = []
+        if cmd_eco_off(adapters) != 0:
+            print("\nX 独显未回线（恢复混合未完成），中止直连编排。")
+            return 1
+        print("\n--- 独显已回线，继续直连 ---")
+
+    print("\n--- 发送直连命令（GCU 控制通道，纯 Action 报文与控制中心同路线）---")
+    status, events = gcu_mqtt_command(GCU_DIRECT_ON_CMD, listen_secs=2.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+        return 1
+    print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_ON）")
+    print_gcu_events(events)
+
+    print("\n--- 等待 GCU 确认（GETSTATUS 复查直连状态翻转，7×1.8s）---")
+    ok, cur = wait_direct_status("TOGGLE_ON")
+    if not ok:
+        print(f"\nX GCU 未确认直连指令（当前直连状态: {cur or '无回报'}）。")
+        print_gcu_events(events)
+        res = read_display_mode_state()
+        enrich_with_gcu_status(res)
+        print_mode_state(res)
+        print("建议：重启是 MUX pending 卡住的实测恢复手段"
+              "（L-Mechrevo 同款实录）；「GPU output route unknown」场景同理。")
+        return 1
+    print(f"  ✓ GCU 已确认（直连状态 = {cur}）——处于待重启态，重启后内屏改由独显驱动。")
+
+    choice = direct_restart_choice()
+    if choice == "1":
+        if not restart_countdown():
+            return 0  # 倒计时取消：命令已发，如实停在待重启态
+        print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
+        rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
+        if rst != "ok":
+            print(f"X 重启命令发送失败：{rst}")
+            print("  机器未重启；已处于待重启态，可稍后手动重启或重跑 --direct on。")
+            return 1
+        print("  ✓ 重启命令已发出，机器即将重启。")
+        return 0
+    if choice == "2":
+        print("  保持待重启态：稍后自行重启即完成直连（--status 显示待重启态）。")
+        return 0
+    print("  已取消重启安排。直连命令已发出，当前仍处于待重启态——"
+          "重启前显示模式不变；重启后即切换为独显直连。")
+    return 0
+
+
+def cmd_direct_off() -> int:
+    """直连 → 混合（MUX 切换，重启生效；方案 §三 E cmd_direct_off）。
+
+    同构：TOGGLE_OFF → 确认翻转 → 重启三选。
+    省去 300ms 补发序列（那是 GCU 侧收到的主状态机行为，客户端单命令即可；
+    若真机嗅探发现需要补发再对齐——方案 §四 验证项 R2）。
+    """
+    print("=== 直连回混合切换编排（探测 → 发令 → GCU 确认 → 重启三选）===")
+    info, rc = _direct_capability_gate("DGPU_DIRECT_CONNECT_TOGGLE_OFF")
+    if info is None:
+        return rc
+
+    st = read_display_mode_state()
+    enrich_with_gcu_status(st)
+    print_mode_state(st)
+    if st.mode == "hybrid":
+        print("\n已在混合模式（独显在线、内屏由核显驱动），无需切换。")
+        return 0
+    if st.mode == "direct_pending" and st.gcu_intent == 1:
+        print("\n「直连回混合」指令已生效待重启：重启后即回到混合模式。")
+        return 0
+    if st.mode not in ("dgpu_direct", "direct_pending"):
+        print(f"\n当前不在直连态或直连待重启态（{MODE_LABELS.get(st.mode, st.mode)}），"
+              "本命令只负责直连 → 混合。")
+        return 1
+
+    print("\n--- 发送切换命令（GCU 控制通道，纯 Action 报文与控制中心同路线）---")
+    status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+        return 1
+    print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
+    print_gcu_events(events)
+
+    print("\n--- 等待 GCU 确认（GETSTATUS 复查直连状态翻转，7×1.8s）---")
+    ok, cur = wait_direct_status("TOGGLE_OFF")
+    if not ok:
+        print(f"\nX GCU 未确认切换指令（当前直连状态: {cur or '无回报'}）。")
+        res = read_display_mode_state()
+        enrich_with_gcu_status(res)
+        print_mode_state(res)
+        print("建议：重启是 MUX pending 卡住的实测恢复手段（L-Mechrevo 同款实录）。")
+        return 1
+    print(f"  ✓ GCU 已确认（直连状态 = {cur}）——处于待重启态，重启后回到混合模式。")
+
+    choice = direct_restart_choice()
+    if choice == "1":
+        if not restart_countdown():
+            return 0
+        print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
+        rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
+        if rst != "ok":
+            print(f"X 重启命令发送失败：{rst}")
+            print("  机器未重启；已处于待重启态，可稍后手动重启或重跑 --direct off。")
+            return 1
+        print("  ✓ 重启命令已发出，机器即将重启。")
+        return 0
+    if choice == "2":
+        print("  保持待重启态：稍后自行重启即回到混合模式（--status 显示待重启态）。")
+        return 0
+    print("  已取消重启安排。切换命令已发出，当前仍处于待重启态——"
+          "重启前保持直连显示；重启后回到混合模式。")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="识别哪个进程在占用独立显卡（WDDM 性能计数器，任务管理器同款数据）")
@@ -1344,11 +2270,19 @@ def main() -> int:
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
     ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off"],
                     metavar="{on,off}",
-                    help="显示模式切换编排（全程自动，GCU 控制通道与控制中心同路线）："
+                    help="核显省电切换编排（全程自动，GCU 控制通道与控制中心同路线）："
                          "on = 检测独显占用并清场后发官方同款命令开启核显省电并验证（默认）；"
                          "off = 发命令切回混合模式并验证")
+    ap.add_argument("--direct", nargs="?", const="on", choices=["on", "off"],
+                    metavar="{on,off}",
+                    help="独显直连切换（MUX 切换，重启后生效）："
+                         "on = 发直连命令并确认，重启三选（默认；核显省电态自动先串联恢复混合）；"
+                         "off = 直连回混合，同构编排")
+    ap.add_argument("--gcu-info", action="store_true",
+                    help="打印 GCU 探测结果（代际/词表/能力位/意图回报，诊断入口）")
     ap.add_argument("--status", action="store_true",
-                    help="报告当前显示模式与凭证（PnP problem code / DXGI / GCU 注册表）")
+                    help="报告当前显示模式与凭证（内屏路由 / PnP problem code / DXGI / "
+                         "GCU 注册表与意图回报）")
     ap.add_argument("--interval", type=float, default=1.0, help="watch 间隔秒数（默认 1）")
     ap.add_argument("--yes", action="store_true",
                     help="eco on 清场确认自动应答 1（无人值守；会直接强杀候选进程）")
@@ -1356,6 +2290,10 @@ def main() -> int:
                     help="eco on 清场豁免名单（逗号分隔进程名，不区分大小写）：其余候选照杀、"
                          "豁免者保留在场，用于实测豁免对象是否挡切换判据（无人值守）")
     args = ap.parse_args()
+
+    if args.gcu_info:
+        print_gcu_info(probe_gcu())
+        return 0
 
     try:
         adapters_meta = enumerate_adapters()
@@ -1368,8 +2306,29 @@ def main() -> int:
         return 0
 
     if args.status:
-        print_mode_state(read_display_mode_state())
+        st = read_display_mode_state()
+        if enrich_with_gcu_status(st) != "ok":
+            print("（GCU 意图回报不可得——离线或通道被占；以下仅本地凭证判定）")
+        print_mode_state(st)
         return 0
+
+    if args.direct == "off" or args.direct == "on":
+        log_path = eco_log_path("direct")
+        log = _Tee(log_path)
+        sys.stdout = log  # 双写：终端 + 日志
+        try:
+            print(f"（本次运行日志: {log_path}）")
+            return cmd_direct_off() if args.direct == "off" else cmd_direct_on()
+        finally:
+            sys.stdout = log._out
+            log.close()
+            # 跑完停窗：提权重启的新窗口在进程退出后即关闭，输出会丢；
+            # 管道/重定向（无人值守）不停
+            if sys.stdin and sys.stdin.isatty():
+                try:
+                    input("\n按回车关闭窗口…")
+                except EOFError:
+                    pass
 
     if args.eco == "off":
         return cmd_eco_off(adapters_meta)

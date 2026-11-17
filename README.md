@@ -1,9 +1,27 @@
 # dgpu_detective — 独显占用侦探
 
-识别**到底是哪个进程在占用独立显卡**，导致独显无法休眠/关闭。
+识别**到底是哪个进程在占用独立显卡**，导致独显无法休眠/关闭；
+并支持机械革命 GCU 机型的显示模式三态切换（核显省电 ⇄ 混合 ⇄ 独显直连）。
 
 灵感与计数器方案借鉴自 [shanselman/gputaskman](https://github.com/shanselman/gputaskman)
 （参考仓库快照在 `reference/gputaskman-src/`，核心是它的 `pdh.py` + `dxgi.py`）。
+
+## 适用范围（显示模式切换功能）
+
+占用检测/驱动层口径全机型可用；**显示模式切换（--eco / --direct）只支持走 GCU 的
+机械革命机型**（同方 AiStone 模具：30/40/50 系、WJXY 无界系）。宝龙达 Uniwill 模具
+（蛟龙 30 系部分、WUJIE14XA、星耀、UMI/NUC）不在范围。
+
+各代际能力（发令前按词表硬门禁，词表外命令一律不发）：
+
+| 代际 | 核显省电 | 直连⇄混合 | 说明 |
+|---|---|---|---|
+| 30 系 | ✗ | ✓（TOGGLE_ON/OFF） | 无重启命令；词表外动作自动拒绝 |
+| 40 系 | 三模档 ✓ / 双模档 ✗ | ✓ | 档位按能力位自动判定；三模待真机反馈 |
+| 50 系 | ✓ | ✓ | 本机实测机型；热切换词表在但 GCU 侧 no-op，不提供 |
+
+`--gcu-info` 可随时查看本机探测结果（代际/词表/能力位/GCU 意图回报）。
+30/40 系行为由能力探测 + 代际词表设计保证「最坏情况如实报不支持」，待真机反馈。
 
 ## 用法
 
@@ -14,12 +32,16 @@ python dgpu_detective.py --all          # 核显等非独显适配器也一并�
 python dgpu_detective.py --watch        # 持续监视独显，新持有进程冒头即时报告
 python dgpu_detective.py --watch --interval 2
 python dgpu_detective.py --json         # 一次性 JSON 快照
-python dgpu_detective.py --status       # 当前显示模式与凭证（PnP / DXGI / GCU 注册表）
+python dgpu_detective.py --status       # 当前显示模式与凭证（内屏路由/PnP/DXGI/GCU 意图）
+python dgpu_detective.py --gcu-info     # GCU 探测结果（代际/词表/能力位/意图回报）
 python dgpu_detective.py --eco          # 核显省电一键切换（检测→清场→发官方同款命令→验证，全自动）
 python dgpu_detective.py --eco off      # 切回混合模式（发官方同款命令→验证）
+python dgpu_detective.py --direct       # 独显直连（发令→GCU确认→重启三选；MUX 切换重启生效）
+python dgpu_detective.py --direct off   # 直连回混合（同构编排）
 ```
 
-仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll`），无需管理员权限。
+仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll` 等），无需管理员权限
+（`--eco` 清场与 `--direct` 重启确认按需提权/确认）。
 
 ## 图形界面（GUI / exe）
 
@@ -30,14 +52,16 @@ pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefil
 ```
 
 - **exe 双击即请求管理员**（uac-admin 清单）——杀提权占用软件、切换省电都需要；
-  切换编排原样复用命令行 `--eco` 代码，只是跑在内嵌控制台里
+  切换编排原样复用命令行 `--eco` / `--direct` 代码，只是跑在内嵌控制台里
 - 持有者表格 = `--report`/`--watch` 常驻版：自动刷新（间隔可调）、新持有黄底高亮、
   右键菜单（结束进程树 / 结束全部同名 / 复制 PID / 打开文件位置），保护名单标红不杀；
   显卡列表每轮随采样重新枚举——切换显示模式后适配器消失/重现（LUID 变化）不失配，
   概要条同步撤掉已消失的适配器
-- 底部徽章 = `--status` 三态凭证实时显示（PnP problem / DXGI / GCU 注册表）
-- 「核显省电 / 恢复混合」按钮 = 内嵌控制台运行完整切换编排，问答弹框应答，
-  输出同步留档 `logs/eco_*.txt`；「导出 JSON」= `--json` 同构快照
+- 底部徽章 = `--status` 四态凭证实时显示（内屏路由 / PnP problem / DXGI / GCU 意图），
+  附能力角标（代际 + 直连/省电能力位，启动时后台探测一次）
+- 「核显省电 / 恢复混合 / 独显直连 / 直连回混合」按钮 = 内嵌控制台运行完整切换编排，
+  按当前态与能力自动启用/禁用；问答弹框应答（重启三选默认安全侧「稍后自行重启」），
+  输出同步留档 `logs/eco_*.txt`、`logs/direct_*.txt`；「导出 JSON」= `--json` 同构快照
 - 驱动层持有者（NVAPI/NVML 模块口径，补 WDDM 盲区）**合并进主表格**：后台线程
   每 3s 自动扫，不手动刷新——WDDM 表里已有的进程在其行「NV 模块」列标注；
   WDDM 抓不到的（HWiNFO 等无图形上下文的传感器轮询软件）追加紫底行
@@ -74,18 +98,37 @@ D3D / Vulkan / OpenGL / CUDA 全都过这一层（GeForce WDDM 模式下 nvidia-
 
 ## 显示模式状态与切换
 
-### 三态判据（--status）
+### 四态判据（--status）
 
-2026-11-11 实测定案：机械革命官方「核显省电」成功 = **EC 级断开**——独显设备
-从 PCI 总线消失（devnode 成幻影、DXGI 枚举不到）。判据走 cfgmgr32 双姿势定位：
+三套独立凭证正交组合：
 
-| PnP 状态 | 含义 | 判定 |
+**凭证 A：内屏路由探测**（QueryDisplayConfig + GET_ADAPTER_NAME）——枚举显示路径，
+过滤内屏 target（INTERNAL/LVDS/eDP/UDI 内接形态），看它挂在哪块适配器上：
+含 `VEN_10DE` = 独显直连态；`VEN_8086`/`VEN_1002` = 核显。**直连态的本机权威判据**。
+
+**PnP problem code**（cfgmgr32 双姿势定位）——2026-11-11 实测定案：官方「核显省电」
+成功 = **EC 级断开**，独显设备从 PCI 总线消失（devnode 成幻影、DXGI 枚举不到）：
+
+| PnP 状态 | 含义 | 判定（内屏挂核显时） |
 |---|---|---|
 | 在线（problem=0） | 设备在场正常工作 | 混合模式 |
 | 软禁用（problem=22） | PnP 软件禁用，设备仍焊在总线上 | 假切换残留 |
 | 已断开（幻影） | NORMAL 定位失败、PHANTOM 定位成功 | 核显省电（真切换） |
 
-辅证：DXGI 独显可见性 + GCU 注册表 `IGPUonly`（切换成功时由 GCU 亲手更新）。
+**凭证 B：GCU 意图回报**（MQTT GETSTATUS）——与凭证 A 实况不一致时记
+**直连待重启态（direct_pending）**：直连命令发出后、重启前只有 GCU 知道有
+pending 切换（官方控制中心的橙色高亮即此态）。
+
+辅证：DXGI 独显可见性 + GCU 注册表 `IGPUonly`（三根回退：GamingCenter2 →
+GamingCenter → ControlCenter，切换成功时由 GCU 亲手更新）。
+
+### GCU 探测（--gcu-info）
+
+诊断入口，一次打印：机器身份（IsMechrevo 判定）、dGPU 代际（显卡名 RTX 正则 →
+PCI DeviceId 高字节两级判定）、本机代际词表（发令硬门禁）、能力位（核显省电 /
+独显直连，在线回报优先、注册表三根双视图回落）、GCU 通道状态与意图回报原文。
+MQTT 凭据走三槽回退链（_4 → _3 → _2）：官方控制中心/L-Mechrevo 占用首选槽时
+自动落下一槽，三槽全被拒才报通道不可用。
 
 ### 核显省电切换（--eco）
 
@@ -141,6 +184,26 @@ GCUService 收令后的判据检查、NV 服务联动、EC 写入、超时回滚
 当前在省电态时可用：MQTT 发送 `IGPU_ONLY_CONNECT_RB_OFF`（与控制中心点击同路线），
 轮询验证独显重新在线（PnP 在线 + DXGI 重现，2026-11-11 实测 6 秒完成）。
 不杀进程、不动 PnP，无需提权。
+
+### 独显直连切换（--direct / --direct off）
+
+MUX 切换，**重启后生效**（内屏改由独显直接驱动；官方「Yes 立即重启 / No 重启后
+生效」同款语义）。纯 `{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_ON/OFF"}` 报文，
+与控制中心点击同路线；`--eco` 行为不变，仅头部插入能力/词表前置。
+
+`--direct`（混合 → 直连）流程：
+
+1. **能力/词表前置**：不支持直连或词表外命令 → 如实退出（30 系无机种不发空命令）
+2. **四态检查**：已直连 → 无需切换；已在「直连待重启」→ 提示重启即成；
+   **核显省电态 → 自动串联「恢复混合」等独显回线再继续**（一次命令完成）
+3. **发令 + GCU 确认**：GETSTATUS 复查直连状态翻转 `TOGGLE_ON`（7×1.8s 上限）
+4. **重启三选**：[1] 立即重启（5 秒可取消倒计时后发 `DGPU_DIRECT_CONNECT_RESTART`，
+   GCU 自己执行 `shutdown /r /t 0`）；[2] 稍后自行重启（保持待重启态，
+   `--status` 显示 direct_pending）；[回车] 取消重启安排（命令已发，如实说明
+   仍处待重启态——重启前显示模式不变）
+
+`--direct off`（直连 → 混合）同构；退出直连同样需要重启。
+GUI 的重启三选走问答框，默认应答取安全侧（2=稍后自行重启）。
 
 ## 独显关不掉的排查思路
 
