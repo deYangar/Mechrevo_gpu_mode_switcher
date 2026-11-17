@@ -1,15 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
 # 独显占用侦探单文件打包：dgpu_detective.exe（onefile + windowed + uac_admin）
-# 双击即 UAC 提权运行，界面为 dgpu_gui.py；构建入口：pwsh -NoProfile -File build_exe.ps1
+# 双击即 UAC 提权运行，界面为 dgpu_gui.py（CustomTkinter 深色）；构建入口：pwsh -NoProfile -File build_exe.ps1
 
 from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# CTk 的主题 JSON/字体是运行时数据文件，不进包 = 启动即崩；子模块全收防动态 import 漏
+ctk_datas = collect_data_files("customtkinter")
+ctk_hidden = collect_submodules("customtkinter")
 
 a = Analysis(
     ['dgpu_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=ctk_datas,
+    hiddenimports=ctk_hidden,
+    # PIL 是 CTk 的可选依赖（仅 CTkImage 图片路径用到，try/except 包着）；
+    # 本 GUI 全文字零图片，排除省 ~17MB（29.0 → 12.1 MB 实测）
+    excludes=['PIL'],
     hookspath=[],
     runtime_hooks=[],
     noarchive=False,

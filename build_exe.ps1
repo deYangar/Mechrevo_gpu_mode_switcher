@@ -3,12 +3,19 @@
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
-# 依赖检查：缺 pyinstaller 就装（清华镜像）
+# 依赖检查：缺 pyinstaller / customtkinter 就装（清华镜像）
 python -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "安装 pyinstaller ..."
     python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyinstaller
     if ($LASTEXITCODE -ne 0) { throw "pyinstaller 安装失败" }
+}
+
+python -c "import customtkinter" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "安装 customtkinter ..."
+    python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple customtkinter
+    if ($LASTEXITCODE -ne 0) { throw "customtkinter 安装失败" }
 }
 
 python -m PyInstaller --noconfirm --clean --log-level WARN dgpu_detective.spec
