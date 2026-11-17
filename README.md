@@ -38,6 +38,7 @@ python dgpu_detective.py --eco          # 核显省电一键切换（检测→�
 python dgpu_detective.py --eco off      # 切回混合模式（发官方同款命令→验证）
 python dgpu_detective.py --direct       # 独显直连（发令→GCU确认→重启三选；MUX 切换重启生效）
 python dgpu_detective.py --direct off   # 直连回混合（同构编排）
+python dgpu_detective.py --hybrid       # 回混合模式（目标态入口，按当前态自动路由上面两条回混合路）
 ```
 
 仅 Python 标准库（ctypes 调 `pdh.dll` + `dxgi.dll` 等），无需管理员权限
@@ -59,9 +60,11 @@ pwsh -NoProfile -File build_exe.ps1    # 产出 dist/dgpu_detective.exe（onefil
   概要条同步撤掉已消失的适配器
 - 底部徽章 = `--status` 四态凭证实时显示（内屏路由 / PnP problem / DXGI / GCU 意图），
   附能力角标（代际 + 直连/省电能力位，启动时后台探测一次）
-- 「核显省电 / 恢复混合 / 独显直连 / 直连回混合」按钮 = 内嵌控制台运行完整切换编排，
-  按当前态与能力自动启用/禁用；问答弹框应答（重启三选默认安全侧「稍后自行重启」），
-  输出同步留档 `logs/eco_*.txt`、`logs/direct_*.txt`；「导出 JSON」= `--json` 同构快照
+- 「独显直连 / 混合模式 / 核显省电」按钮 = 内嵌控制台运行完整切换编排，
+  按当前态与能力自动启用/禁用；「混合模式」为目标态入口（省电态走 MQTT 回线、
+  直连态走 MUX 重启三选，自动挑路）；问答弹框应答（重启三选默认安全侧「稍后自行重启」），
+  输出同步留档 `logs/eco_*.txt`、`logs/hybrid_*.txt`、`logs/direct_*.txt`；
+  「导出 JSON」= `--json` 同构快照
 - 驱动层持有者（NVAPI/NVML 模块口径，补 WDDM 盲区）**合并进主表格**：后台线程
   每 3s 自动扫，不手动刷新——WDDM 表里已有的进程在其行「NV 模块」列标注；
   WDDM 抓不到的（HWiNFO 等无图形上下文的传感器轮询软件）追加紫底行

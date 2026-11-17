@@ -3,9 +3,11 @@
 - 持有者表格 = --report/--watch 的常驻版：自动刷新，新持有黄底高亮
 - 显示模式徽章 = --status 四态凭证（内屏路由 / PnP problem / DXGI / GCU 意图回报），
   附能力角标（代际 + 直连/省电能力位，启动后台探测一次）
-- 「核显省电 / 恢复混合 / 独显直连 / 直连回混合」= 内嵌控制台原样运行
-  cmd_eco_on / cmd_eco_off / cmd_direct_on / cmd_direct_off：
-  print 重定向进日志面板（双写 logs/eco_*.txt、logs/direct_*.txt 留档），
+- 「独显直连 / 混合模式 / 核显省电」（按性能排）= 内嵌控制台原样运行
+  cmd_direct_on / cmd_hybrid / cmd_eco_on（cmd_hybrid 按当前态自动路由
+  cmd_eco_off / cmd_direct_off）：
+  print 重定向进日志面板（双写 logs/eco_*.txt、logs/hybrid_*.txt、
+  logs/direct_*.txt 留档），
   ask() 的 input() 弹问答框应答（重启三选默认安全侧），
   编排代码零改动——CLI 双向真测过的路径就是 GUI 跑的路径
 - 驱动层持有者（NVAPI/NVML 口径，补 WDDM 盲区）合并进主表格：后台线程自动扫，
@@ -150,8 +152,9 @@ class App:
     def __init__(self, root: tk.Tk, adapters: list):
         self.root = root
         root.title("独显占用侦探")
-        # 1180 起：四切换按钮（核显省电/恢复混合/独显直连/直连回混合）在工具栏
-        # 单行全部可见（1040 下末键被裁出可视区，2026-11-17 exe 截图实测）
+        # 三切换按钮（核显省电/混合模式/独显直连）在工具栏单行可见；
+        # 曾是四按钮时代定的 1180（1040 下末键被裁，2026-11-17 exe 截图实测），
+        # 2026-11-17 两回混合按钮合一后沿用，余量让给表格列
         root.geometry("1180x720")
         root.minsize(1000, 560)
         self._autorun_done = False    # DGPU_TEST_AUTORUN 钩子只触发一次
@@ -225,18 +228,18 @@ class App:
         ttk.Button(bar, text="导出 JSON", command=self._export_json).pack(side="left", padx=6)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        self.eco_on_btn = ttk.Button(bar, text="核显省电",
-                                     command=lambda: self.run_switch("on"))
-        self.eco_on_btn.pack(side="left")
-        self.eco_off_btn = ttk.Button(bar, text="恢复混合",
-                                      command=lambda: self.run_switch("off"))
-        self.eco_off_btn.pack(side="left", padx=6)
+        # 按性能排：独显直连（独显全力）→ 混合模式 → 核显省电（独显下线）；
+        # 混合模式 = 目标态入口，cmd_hybrid 按当前态自动挑路
+        # （省电态走 MQTT 回线、直连态走 MUX 重启），曾是两个互斥按钮
         self.direct_on_btn = ttk.Button(bar, text="独显直连",
                                         command=lambda: self.run_switch("direct_on"))
         self.direct_on_btn.pack(side="left")
-        self.direct_off_btn = ttk.Button(bar, text="直连回混合",
-                                         command=lambda: self.run_switch("direct_off"))
-        self.direct_off_btn.pack(side="left", padx=6)
+        self.hybrid_btn = ttk.Button(bar, text="混合模式",
+                                     command=lambda: self.run_switch("hybrid"))
+        self.hybrid_btn.pack(side="left", padx=6)
+        self.eco_on_btn = ttk.Button(bar, text="核显省电",
+                                     command=lambda: self.run_switch("on"))
+        self.eco_on_btn.pack(side="left")
 
         # 中央：上持有者表格 / 下 Notebook，可拖分界
         pw = ttk.PanedWindow(self.root, orient="vertical")
@@ -312,8 +315,8 @@ class App:
                    command=self._clear_log).pack(side="left")
         ttk.Button(topbar, text="打开日志目录", width=12,
                    command=self._open_log_dir).pack(side="left", padx=6)
-        ttk.Label(topbar, text="「核显省电/恢复混合」在下方运行完整切换编排，"
-                               "输出同步留档 logs/eco_*.txt",
+        ttk.Label(topbar, text="切换按钮在下方运行完整切换编排，"
+                               "输出同步留档 logs/（eco_/hybrid_/direct_）",
                   foreground="#666").pack(side="left", padx=6)
 
         body = ttk.Frame(frame)
@@ -701,9 +704,9 @@ class App:
     # ------------------------------------------------------------- 切换编排（内嵌控制台）
 
     def run_switch(self, target: str):
-        """target: on/off（核显省电方向）/ direct_on/direct_off（独显直连方向）。
+        """target: direct_on（独显直连）/ hybrid（回混合，按态自动路由）/ on（核显省电）。
 
-        direct 方向不杀进程不动 PnP（省电态串联的 cmd_eco_off 同样无需提权），
+        hybrid/direct 方向不杀进程不动 PnP（省电态串联的 cmd_eco_off 同样无需提权），
         所以只有 eco on 要求管理员——与 CLI 口径一致。
         """
         if self.switch_running:
@@ -720,7 +723,7 @@ class App:
         threading.Thread(target=self._switch_worker, args=(target,), daemon=True).start()
 
     def _switch_buttons(self) -> tuple:
-        return (self.eco_on_btn, self.eco_off_btn, self.direct_on_btn, self.direct_off_btn)
+        return (self.direct_on_btn, self.hybrid_btn, self.eco_on_btn)
 
     def _update_switch_buttons(self):
         """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）。"""
@@ -732,17 +735,20 @@ class App:
         i = self.gcu_info
         eco_ok = not (i and i.igpu_only is False)
         direct_ok = not (i and i.dgpu_direct is False)
-        self.eco_on_btn.config(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
-        self.eco_off_btn.config(state="normal" if mode == "igpu_only" else "disabled")
         self.direct_on_btn.config(
             state="normal" if mode != "dgpu_direct" and direct_ok else "disabled")
-        self.direct_off_btn.config(
-            state="normal" if mode in ("dgpu_direct", "direct_pending") else "disabled")
+        # 混合模式在三种非混合态可点；走哪条路由 cmd_hybrid 现场判，
+        # 词表/能力细 gate 也在各分支里（同 CLI 口径）
+        self.hybrid_btn.config(
+            state="normal" if mode in ("igpu_only", "dgpu_direct", "direct_pending")
+            else "disabled")
+        self.eco_on_btn.config(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
 
     def _switch_worker(self, target: str):
         co_init()
         try:
-            logf = open(eng.eco_log_path("direct" if target.startswith("direct") else "eco"),
+            logf = open(eng.eco_log_path({"on": "eco", "hybrid": "hybrid",
+                                          "direct_on": "direct"}[target]),
                         "w", encoding="utf-8", errors="replace", buffering=1)
         except OSError as e:
             self.log_q.put(f"（日志文件创建失败，仅面板显示：{e}）\n")
@@ -750,10 +756,9 @@ class App:
         sink = _LogSink(self.log_q, logf)
         self._sink = sink
         titles = {
-            "on": "核显省电切换（检测 → 清场 → 官方同款命令 → 凭证验证）",
-            "off": "显示模式切换：核显省电 → 混合模式",
             "direct_on": "独显直连切换（探测 → 发令 → GCU 确认 → 重启三选）",
-            "direct_off": "直连回混合切换（探测 → 发令 → GCU 确认 → 重启三选）",
+            "hybrid": "回混合模式（按当前态自动路由：省电→MQTT 回线 / 直连→MUX 重启三选）",
+            "on": "核显省电切换（检测 → 清场 → 官方同款命令 → 凭证验证）",
         }
         sink.write(f"\n===== {titles.get(target, target)} "
                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
@@ -767,12 +772,10 @@ class App:
                         rc = eng.cmd_eco_on(counters, list(self.adapters))
                     finally:
                         counters.close()
-                elif target == "off":
-                    rc = eng.cmd_eco_off(list(self.adapters))
-                elif target == "direct_on":
-                    rc = eng.cmd_direct_on()
+                elif target == "hybrid":
+                    rc = eng.cmd_hybrid()
                 else:
-                    rc = eng.cmd_direct_off()
+                    rc = eng.cmd_direct_on()
         except Exception:
             sink.write(traceback.format_exc())
         finally:
@@ -891,7 +894,7 @@ class App:
         lines.append(f"detail: w={self.detail.winfo_width()} "
                      f"wraplength={self.detail.cget('wraplength')} "
                      f"tree_w={self.tree.winfo_width()}")
-        # 切换编排状态（通用化自测）：GCU 探测与四按钮态
+        # 切换编排状态（通用化自测）：GCU 探测与三按钮态
         gi = self.gcu_info
         lines.append(f"gcu_info: {None if gi is None else (gi.connected, gi.generation, gi.client_id, gi.igpu_only, gi.dgpu_direct)}")
         lines.append("buttons: " + ",".join(

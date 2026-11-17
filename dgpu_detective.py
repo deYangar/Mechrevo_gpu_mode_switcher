@@ -2308,6 +2308,38 @@ def cmd_direct_off() -> int:
         "保持独显直连", "可重跑 --direct on 撤回")
 
 
+def cmd_hybrid() -> int:
+    """统一「回混合」入口（--hybrid / GUI「混合模式」按钮）：按当前态自动路由。
+
+    目标态式入口，与控制中心「选目标、路径自挑」同思路——两条回混合的路
+    协议不同（省电态走 MQTT 让独显回线、无需重启；直连态走 MUX 切换、重启
+    生效），但用户只关心目的地：
+    hybrid → 无事可做；igpu_only → 复用 cmd_eco_off；
+    dgpu_direct / direct_pending → 复用 cmd_direct_off；
+    pnp_disabled / unknown → 拒绝（先恢复干净混合态再操作）。
+    """
+    st = read_display_mode_state()
+    enrich_with_gcu_status(st)
+    if st.mode == "igpu_only":
+        print("=== 回混合模式：核显省电 → 混合（MQTT，独显回线，无需重启）===")
+        try:
+            adapters = enumerate_adapters()
+        except OSError:
+            adapters = []
+        return cmd_eco_off(adapters)
+    if st.mode in ("dgpu_direct", "direct_pending"):
+        print("=== 回混合模式：直连/待重启 → 混合（MUX 切换，重启生效）===")
+        return cmd_direct_off()
+    print("=== 回混合模式 ===")
+    print_mode_state(st)
+    if st.mode == "hybrid":
+        print("\n已在混合模式（独显在线、内屏由核显驱动），无需切换。")
+        return 0
+    print(f"\n当前显示模式不干净（{MODE_LABELS.get(st.mode, st.mode)}），无法自动路由。")
+    print("  请先恢复到干净的混合模式（设备管理器启用 NVIDIA 设备）后重试。")
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="识别哪个进程在占用独立显卡（WDDM 性能计数器，任务管理器同款数据）")
@@ -2325,6 +2357,10 @@ def main() -> int:
                     help="独显直连切换（MUX 切换，重启后生效）："
                          "on = 发直连命令并确认，重启三选（默认；核显省电态自动先串联恢复混合）；"
                          "off = 直连回混合，同构编排")
+    ap.add_argument("--hybrid", action="store_true",
+                    help="切回混合模式（目标态入口，按当前态自动路由）："
+                         "核显省电态走 MQTT 恢复混合（无需重启）；直连/待重启态走 MUX 切换"
+                         "（重启三选）；已混合则无事可做")
     ap.add_argument("--gcu-info", action="store_true",
                     help="打印 GCU 探测结果（代际/词表/能力位/意图回报，诊断入口）")
     ap.add_argument("--status", action="store_true",
@@ -2358,6 +2394,24 @@ def main() -> int:
             print("（GCU 意图回报不可得——离线或通道被占；以下仅本地凭证判定）")
         print_mode_state(st)
         return 0
+
+    if args.hybrid:
+        log_path = eco_log_path("hybrid")
+        log = _Tee(log_path)
+        sys.stdout = log  # 双写：终端 + 日志
+        try:
+            print(f"（本次运行日志: {log_path}）")
+            return cmd_hybrid()
+        finally:
+            sys.stdout = log._out
+            log.close()
+            # 跑完停窗：提权重启的新窗口在进程退出后即关闭，输出会丢；
+            # 管道/重定向（无人值守）不停
+            if sys.stdin and sys.stdin.isatty():
+                try:
+                    input("\n按回车关闭窗口…")
+                except EOFError:
+                    pass
 
     if args.direct == "off" or args.direct == "on":
         log_path = eco_log_path("direct")
