@@ -278,20 +278,21 @@ class App:
         pw.add(tree_frame, weight=3)
         self._build_log_pane(pw)
 
-        # 底部状态栏
+        # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
+        # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
         sb = ttk.Frame(self.root, padding=(10, 2, 10, 6))
         sb.grid(row=3, column=0, sticky="ew")
-        sb.columnconfigure(1, weight=1)
+        sb.columnconfigure(0, weight=1)
         self.mode_badge = tk.Label(sb, text=" … ", bg="#eeeeee", fg="#333",
                                    padx=10, pady=2)
         self.mode_badge.grid(row=0, column=0, sticky="w")
-        self.evidence = ttk.Label(sb, text="三凭证读取中…", foreground="#444")
-        self.evidence.grid(row=0, column=1, sticky="w", padx=10)
         admin = "管理员 ✓" if eng.is_admin() else "管理员 ✗（杀提权进程/切换需提权）"
         self.admin_label = ttk.Label(sb, text=admin, foreground=("#1a6b2f" if eng.is_admin() else "#9c1f1f"))
-        self.admin_label.grid(row=0, column=2, sticky="e")
+        self.admin_label.grid(row=0, column=1, sticky="e")
         self.refresh_label = ttk.Label(sb, text="", foreground="#666")
-        self.refresh_label.grid(row=0, column=3, sticky="e", padx=(10, 0))
+        self.refresh_label.grid(row=0, column=2, sticky="e", padx=(10, 0))
+        self.evidence = ttk.Label(sb, text="三凭证读取中…", foreground="#444")
+        self.evidence.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="结束进程树（PID）", command=lambda: self._kill(by_pid=True))
@@ -865,6 +866,10 @@ class App:
         lines.append("buttons: " + ",".join(
             f"{str(b.cget('text'))}={b.state()}" for b in self._switch_buttons()))
         lines.append(f"badge: {self.mode_badge.cget('text')!r} evidence: {self.evidence.cget('text')!r}")
+        # 状态栏几何：验证两行布局（evidence 须在徽章下一行且占全宽；
+        # 单行回退时两者 y 相等）
+        lines.append(f"statusbar: badge_y={self.mode_badge.winfo_y()} "
+                     f"ev_y={self.evidence.winfo_y()} ev_w={self.evidence.winfo_width()}")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
