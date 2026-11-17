@@ -266,6 +266,7 @@ class App:
         self.rowmeta = {}      # iid -> row dict
         self.new_marks = {}    # iid -> 剩余高亮轮数
         self.prev_keys = set()  # (luid_str, pid)
+        self._table_sig = None  # 上次渲染的数据签名（无变化跳过重建，防拖动/空闲闪烁）
 
         self._build_ui()
 
@@ -369,26 +370,23 @@ class App:
         self.pw = ttk.PanedWindow(self.root, orient="vertical")
         self.pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
 
-        tree_frame = ctk.CTkFrame(self.pw, fg_color="transparent")
+        tree_frame = tk.Frame(self.pw, bg=BG)
         # ttk.Treeview 深色化一处配置（clam 主题才吃 fieldbackground；
         # 默认 vista/w11 主题的 Treeview 配色改不动）
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        # ttk 是原生控件，不吃 CTk 的字体缩放——高 DPI 屏（150%）上与 CTk
-        # 控件同 pt 值也显小（2026-11-17 咩咩反馈：表格字体小）。
-        # pt/行高显式乘窗口缩放系数，对齐 CTk 控件视觉
-        #（不走 root._get_widget_scaling：主窗该属性初始化时序不稳，实测炸）
-        try:
-            scale = ctk.ScalingTracker.get_window_scaling(self.root)
-        except Exception:
-            scale = 1.0
+        # 字号坑两连（2026-11-17 真机两轮校准）：ttk 的 pt 本来就随 DPI
+        # 换算（12pt@150% = 24px），再乘 CTk scaling 是双重缩放（18pt=36px，
+        # 咩咩嫌大）；最初 10pt（=20px）又嫌小。定案 12pt 不乘任何系数。
+        # rowheight/列宽/sashpos 同理都是「ttk 内部再按 DPI 缩放」的重灾区，
+        # 一律给物理目标值。
         style.configure("Dgpu.Treeview", fieldbackground=SURFACE,
                         background=SURFACE, foreground=TEXT,
-                        rowheight=int(34 * scale), borderwidth=0,
-                        font=(FONT_FAMILY, round(12 * scale)))
+                        rowheight=36, borderwidth=0,
+                        font=(FONT_FAMILY, 12))
         style.configure("Dgpu.Treeview.Heading", background=SURFACE2,
                         foreground="#c9d1d9", relief="flat", borderwidth=0,
-                        font=(FONT_FAMILY, round(12 * scale), "bold"))
+                        font=(FONT_FAMILY, 12, "bold"))
         style.map("Dgpu.Treeview",
                   background=[("selected", ACCENT_DARK)],
                   fieldbackground=[("selected", ACCENT_DARK)])
@@ -397,18 +395,19 @@ class App:
                 "nvmods")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                  selectmode="browse", style="Dgpu.Treeview")
+        # 12pt（24px@150%）字号下的列宽；name/engines/nvmods 弹性吸余宽
         for cid, text, w, anchor in (
-                ("gpu", "显卡", 178, "w"), ("pid", "PID", 70, "e"),
-                ("name", "进程", 150, "w"), ("local", "显存(MB)", 88, "e"),
-                ("nonlocal", "共享(MB)", 88, "e"), ("committed", "提交(MB)", 88, "e"),
-                ("engines", "引擎活动", 200, "w"), ("nvmods", "NV 模块", 190, "w")):
+                ("gpu", "显卡", 240, "w"), ("pid", "PID", 80, "e"),
+                ("name", "进程", 160, "w"), ("local", "显存(MB)", 92, "e"),
+                ("nonlocal", "共享(MB)", 92, "e"), ("committed", "提交(MB)", 92, "e"),
+                ("engines", "引擎活动", 210, "w"), ("nvmods", "NV 模块", 200, "w")):
             self.tree.heading(cid, text=text)
-            # 列宽同样乘缩放：字体放大后固定列宽会截断数值/表头
-            #（1251x 五位 PID 只剩四位、表头「显存(MB)」剩「显存(M」，2026-11-17 截图实测）
-            self.tree.column(cid, width=int(w * scale), anchor=anchor,
+            self.tree.column(cid, width=w, anchor=anchor,
                              stretch=(cid in ("name", "engines", "nvmods")))
         ysb = ctk.CTkScrollbar(tree_frame, orientation="vertical",
-                               command=self.tree.yview)
+                               command=self.tree.yview,
+                               fg_color=BG, button_color=BORDER,
+                               button_hover_color=MUTED)
         self.tree.configure(yscrollcommand=ysb.set)
         # 明细条必须最先 pack（pack 按顺序分配空间）：先占满底部整行，
         # 表格和滚动条再填剩余——若表格先 pack 且 expand，整行宽度被吃光，
@@ -419,9 +418,10 @@ class App:
             font=(FONT_FAMILY, 12), fg_color=SURFACE,
             corner_radius=6, padx=8, pady=3)
         self.detail.pack(side="bottom", fill="x")
-        self.detail.bind(
-            "<Configure>",
-            lambda e: self.detail.configure(wraplength=max(200, e.width - 8)))
+        # 拖 sash 时 <Configure> 每个像素都触发一次 configure→CTk 重绘链，
+        # 是拖动卡顿的大头——宽度变化 ≥12px 才真正重配 wraplength
+        self._detail_wrap = 980
+        self.detail.bind("<Configure>", self._on_detail_resize)
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
         self.tree.tag_configure("new", background="#3d2e12",
@@ -436,10 +436,10 @@ class App:
 
         self.pw.add(tree_frame, weight=3)
         self._build_log_pane(self.pw)
-        # 初始 sash 位置：表格为主（requested 高度只随首帧行数走，行少时
-        # 日志区会反客为主；行高放大后 ~12 行需要更多纵向空间，
-        # sash 同步乘缩放），用户仍可拖
-        self.root.after(200, lambda: self.pw.sashpos(0, int(420 * scale)))
+        # 初始 sash 位置：表格为主，日志区保持可见（sashpos 传逻辑值——
+        # ttk 内部会按 DPI 再缩放，乘 scaling 是双重缩放，420×scale 直接把
+        # 日志区挤没了，2026-11-17 咩咩真机截图实证）。用户仍可拖
+        self.root.after(200, lambda: self.pw.sashpos(0, 400))
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
@@ -669,8 +669,14 @@ class App:
         return sum(1 for pid, _, _ in self.nv_rows if pid not in wdm)
 
     def _render_table(self):
-        """按 last_data + nv_rows 重画主表格：WDDM 行 + 驱动层合并渲染。"""
+        """按 last_data + nv_rows 重画主表格：WDDM 行 + 驱动层合并渲染。
+        数据签名没变就跳过（每秒快照大多原地踏步；全清全插在拖 sash 时
+        与重排叠加成肉眼可见的卡顿闪烁，2026-11-17 咩咩反馈）。"""
         data = self.last_data or []
+        sig = self._table_signature(data, self.nv_rows)
+        if sig == self._table_sig:
+            return
+        self._table_sig = sig
         sel = self.tree.selection()
         sel_iid = sel[0] if sel else None
 
@@ -727,6 +733,28 @@ class App:
             }
         if sel_iid and self.tree.exists(sel_iid):
             self.tree.selection_set(sel_iid)
+
+    @staticmethod
+    def _table_signature(data, nv_rows) -> tuple:
+        """表格内容签名：行集合与全部显示值（含引擎占用率）的指纹。
+        排序后 hash，行顺序无关（渲染顺序稳定）。"""
+        sig = []
+        for gpu in data:
+            for r in gpu["processes"]:
+                sig.append((gpu["luid"], r["pid"], r["image"],
+                            round(r["local_mb"], 2), round(r["nonlocal_mb"], 2),
+                            round(r["committed_mb"], 2),
+                            tuple(sorted(r["engines"].items()))))
+        sig.sort()
+        sig.extend(sorted((pid, name, tuple(sorted(mods)))
+                          for pid, name, mods in nv_rows))
+        return tuple(sig)
+
+    def _on_detail_resize(self, e):
+        w = max(200, e.width - 8)
+        if abs(w - self._detail_wrap) >= 12:  # 拖动像素风暴去抖（见绑定处注释）
+            self._detail_wrap = w
+            self.detail.configure(wraplength=w)
 
     def _chip(self, luid, name, discrete):
         if luid not in self.chips:
