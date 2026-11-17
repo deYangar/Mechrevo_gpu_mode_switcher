@@ -2065,8 +2065,11 @@ def wait_direct_status(token: str, rounds: int = 7,
     return False, cur
 
 
-def restart_countdown(seconds: int = 5) -> bool:
-    """RESTART 发送前的 5 秒可取消倒计时二次确认（CLI Ctrl+C 可中断）。"""
+def restart_countdown(effect: str, seconds: int = 5) -> bool:
+    """RESTART 发送前的 5 秒可取消倒计时二次确认（CLI Ctrl+C 可中断）。
+
+    effect 描述重启后的切换效果（「仍会切换为独显直连」/「仍会回到混合模式」）。
+    """
     print(f"  {seconds} 秒后发送重启命令（Ctrl+C 取消）…")
     try:
         for i in range(seconds, 0, -1):
@@ -2074,7 +2077,7 @@ def restart_countdown(seconds: int = 5) -> bool:
             time.sleep(1.0)
         return True
     except KeyboardInterrupt:
-        print("  已取消发送重启命令（保持待重启态，重启后直连切换仍会生效）。")
+        print(f"  已取消发送重启命令（保持待重启态，重启后{effect}）。")
         return False
 
 
@@ -2084,11 +2087,39 @@ def direct_restart_choice() -> str:
     [1] 立即重启 = 发 DGPU_DIRECT_CONNECT_RESTART，GCU 自己执行 shutdown /r /t 0
         （发之前 5 秒可取消倒计时二次确认）
     [2] 稍后自行重启 = 保持待重启态，--status 显示 direct_pending
-    [回车] 取消重启安排 = 命令已发，如实说明当前处于待重启态
+    [回车] 取消切换 = 发反向 TOGGLE 撤回意图（控制中心「再点一下开关」同款），
+        GCU 确认翻回后恢复原模式，无需重启——取消必须真能取消动作
     """
     return ask("[1] 立即重启（5 秒可取消倒计时后由 GCU 执行重启）"
                "  [2] 稍后自行重启（保持待重启态）"
-               "  [回车/其他] 取消重启安排（命令已发，同样处于待重启态）")
+               "  [回车/其他] 取消切换（撤回指令恢复原模式，无需重启）")
+
+
+def _direct_cancel_revert(revert_cmd: str, action_name: str, token: str,
+                          back_desc: str, retry_hint: str) -> int:
+    """三选「取消切换」= 撤回指令：发反向 TOGGLE 并等 GCU 确认翻回。
+
+    与控制中心「再点一下开关」同款；撤回后意图与运行态一致，无需重启。
+    撤回失败如实报错并停在待重启态（可按 retry_hint 重试撤回）。
+    """
+    print("\n--- 取消切换（发送撤回指令，与控制中心再点一下开关同款）---")
+    status, events = gcu_mqtt_command(revert_cmd, listen_secs=2.0)
+    if status != "ok":
+        print(f"X 撤回指令发送失败：{status}——切换意图仍在，重启后仍会生效。")
+        print(f"  {retry_hint}，或 --status 查看当前意图。")
+        return 1
+    print(f"  ✓ 撤回指令已送达（{action_name}）")
+    print_gcu_events(events)
+
+    print("\n--- 等待 GCU 确认撤回（GETSTATUS 复查状态翻回，7×1.8s）---")
+    ok, cur = wait_direct_status(token)
+    if not ok:
+        print(f"X GCU 未确认撤回（当前直连状态: {cur or '无回报'}）——切换意图仍在，"
+              "重启后仍会生效。")
+        print(f"  {retry_hint}。")
+        return 1
+    print(f"  ✓ 切换已撤回（直连状态 = {cur}）——{back_desc}，无需重启。")
+    return 0
 
 
 def _direct_capability_gate(required_action: str) -> tuple[GcuInfo | None, int]:
@@ -2173,11 +2204,19 @@ def cmd_direct_on() -> int:
         print("建议：重启是 MUX pending 卡住的实测恢复手段"
               "（L-Mechrevo 同款实录）；「GPU output route unknown」场景同理。")
         return 1
+    # 免三选：确认翻转后意图与运行态已一致（如重发直连撤掉「退出直连」待重启
+    # 指令后实况本就是直连），重启无增益，直接收尾。意图直接复用刚确认的 cur
+    res = read_display_mode_state()
+    res.gcu_direct_status = cur
+    if res.mode == "dgpu_direct":
+        print(f"\n✓ GCU 已确认（直连状态 = {cur}）——意图与运行态已一致"
+              "（内屏已由独显驱动），无需重启。")
+        return 0
     print(f"  ✓ GCU 已确认（直连状态 = {cur}）——处于待重启态，重启后内屏改由独显驱动。")
 
     choice = direct_restart_choice()
     if choice == "1":
-        if not restart_countdown():
+        if not restart_countdown("仍会切换为独显直连"):
             return 0  # 倒计时取消：命令已发，如实停在待重启态
         print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
         rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
@@ -2190,9 +2229,9 @@ def cmd_direct_on() -> int:
     if choice == "2":
         print("  保持待重启态：稍后自行重启即完成直连（--status 显示待重启态）。")
         return 0
-    print("  已取消重启安排。直连命令已发出，当前仍处于待重启态——"
-          "重启前显示模式不变；重启后即切换为独显直连。")
-    return 0
+    return _direct_cancel_revert(
+        GCU_DIRECT_OFF_CMD, "DGPU_DIRECT_CONNECT_TOGGLE_OFF", "TOGGLE_OFF",
+        "保持混合模式", "可重跑 --direct off 撤回")
 
 
 def cmd_direct_off() -> int:
@@ -2239,11 +2278,19 @@ def cmd_direct_off() -> int:
         print_mode_state(res)
         print("建议：重启是 MUX pending 卡住的实测恢复手段（L-Mechrevo 同款实录）。")
         return 1
+    # 免三选：确认翻转后意图与运行态已一致（如待重启态撤回直连指令后实况
+    # 本就是混合），重启无增益，直接收尾。意图直接复用刚确认的 cur
+    res = read_display_mode_state()
+    res.gcu_direct_status = cur
+    if res.mode == "hybrid":
+        print(f"\n✓ GCU 已确认（直连状态 = {cur}）——意图与运行态已一致"
+              "（混合模式，独显在线），无需重启。")
+        return 0
     print(f"  ✓ GCU 已确认（直连状态 = {cur}）——处于待重启态，重启后回到混合模式。")
 
     choice = direct_restart_choice()
     if choice == "1":
-        if not restart_countdown():
+        if not restart_countdown("仍会回到混合模式"):
             return 0
         print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
         rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
@@ -2256,9 +2303,9 @@ def cmd_direct_off() -> int:
     if choice == "2":
         print("  保持待重启态：稍后自行重启即回到混合模式（--status 显示待重启态）。")
         return 0
-    print("  已取消重启安排。切换命令已发出，当前仍处于待重启态——"
-          "重启前保持直连显示；重启后回到混合模式。")
-    return 0
+    return _direct_cancel_revert(
+        GCU_DIRECT_ON_CMD, "DGPU_DIRECT_CONNECT_TOGGLE_ON", "TOGGLE_ON",
+        "保持独显直连", "可重跑 --direct on 撤回")
 
 
 def main() -> int:
