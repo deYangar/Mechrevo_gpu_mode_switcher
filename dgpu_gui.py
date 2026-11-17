@@ -38,6 +38,36 @@ import dgpu_detective as eng
 # ---------------------------------------------------------------------------
 
 
+def _patch_ctk_button_hitbox() -> None:
+    """CTkButton 6.0.0 命中缺陷治本（module 级类补丁，import 即生效）：
+    command 触发 gate 在 _mouse_inside，而它只由内部 _text_label（文字区）
+    的 <Enter>/<Leave> 维护，画布层连 <ButtonRelease-1> 都没绑——鼠标在
+    文字外的空白区按下/释放时静默无反应（2026-11-17 真机「模式按钮点了
+    没反应」根因：工具栏按钮文字占比不足一半，大面积点不中）。
+    画布与文字层是兄弟层，给画布补绑 Enter/Leave/ButtonRelease 三件套后
+    互补维护 _mouse_inside，整按钮区域命中；hover 高亮顺带覆盖空白区。
+    只补缺失绑定，不动 CTk 状态机；防重入打补丁。"""
+    if getattr(ctk.CTkButton, "_dgpu_hitbox_patched", False):
+        return
+    ctk.CTkButton._dgpu_hitbox_patched = True
+    orig_init = ctk.CTkButton.__init__
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        self._canvas.bind("<Enter>", self._on_enter, add="+")
+        self._canvas.bind("<Leave>", self._on_leave, add="+")
+        self._canvas.bind("<ButtonRelease-1>", self._on_release, add="+")
+
+    ctk.CTkButton.__init__ = patched_init
+
+
+_patch_ctk_button_hitbox()
+
+
+# 模式名（日志反馈用）：与按钮文案一致
+MODE_NAMES = {"direct_on": "独显直连", "hybrid": "混合模式", "on": "核显省电"}
+
+
 def co_init() -> None:
     """工作线程里跑 DXGI 枚举（read_display_mode_state 会调 enumerate_adapters）需要 COM；
     重复初始化返回 S_FALSE，无害。"""
@@ -249,9 +279,11 @@ class App:
     # ------------------------------------------------------------- UI 构建
 
     def _ghost_button(self, master, text, width=88, command=None):
-        """次级按钮统一 ghost 风：透明底 + 描边，主色只留给「当前模式」。"""
-        b = ctk.CTkButton(master, text=text, width=width, height=28,
-                          fg_color="transparent", hover_color=SURFACE2,
+        """次级按钮统一 ghost 风：次级面板实底 + 描边（transparent 底+描边
+        在深窗上发暗难认，2026-11-17 咩咩反馈；实底把按钮从背景里托出来），
+        主色只留给「当前模式」。"""
+        b = ctk.CTkButton(master, text=text, width=width, height=32,
+                          fg_color=SURFACE2, hover_color=BORDER,
                           border_width=1, border_color=BORDER,
                           text_color=TEXT, corner_radius=6,
                           font=(FONT_FAMILY, 12), command=command)
@@ -259,15 +291,19 @@ class App:
 
     def _style_switch(self, btn, target: str, active: bool):
         """切换按钮态式：当前模式的按钮实色高亮，其余中性描边——
-        一眼读出「现在在哪个模式、能去哪」；彩-模式映射与徽章呼应。"""
+        一眼读出「现在在哪个模式、能去哪」；彩-模式映射与徽章呼应。
+        当前态文字锁定白（含 disabled：切换进行中不被 CTk 压成灰黑）；
+        非当前态可点时亮字（MUTED 暗字读不出「可点」，2026-11-17 咩咩反馈），
+        disabled（能力不支持）才落 MUTED 灰。"""
         color, hover = SWITCH_COLORS[target]
         if active:
             btn.configure(fg_color=color, hover_color=hover,
-                          border_width=0, text_color="#ffffff")
+                          border_width=0, text_color="#ffffff",
+                          text_color_disabled="#ffffff")
         else:
             btn.configure(fg_color="transparent", hover_color=SURFACE2,
                           border_width=1, border_color=BORDER,
-                          text_color=MUTED)
+                          text_color=TEXT, text_color_disabled=MUTED)
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
@@ -314,17 +350,17 @@ class App:
         # （省电态走 MQTT 回线、直连态走 MUX 重启三选），曾是两个互斥按钮。
         # 态式：默认中性描边，当前模式的按钮由 _update_switch_buttons 点亮
         self.direct_on_btn = ctk.CTkButton(
-            bar, text="独显直连", width=96, height=28,
+            bar, text="独显直连", width=96, height=32,
             corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("direct_on"))
         self.direct_on_btn.pack(side="left")
         self.hybrid_btn = ctk.CTkButton(
-            bar, text="混合模式", width=96, height=28,
+            bar, text="混合模式", width=96, height=32,
             corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("hybrid"))
         self.hybrid_btn.pack(side="left", padx=6)
         self.eco_on_btn = ctk.CTkButton(
-            bar, text="核显省电", width=96, height=28,
+            bar, text="核显省电", width=96, height=32,
             corner_radius=6, font=(FONT_FAMILY, 12),
             command=lambda: self.run_switch("on"))
         self.eco_on_btn.pack(side="left")
@@ -338,13 +374,21 @@ class App:
         # 默认 vista/w11 主题的 Treeview 配色改不动）
         style = ttk.Style(self.root)
         style.theme_use("clam")
+        # ttk 是原生控件，不吃 CTk 的字体缩放——高 DPI 屏（150%）上与 CTk
+        # 控件同 pt 值也显小（2026-11-17 咩咩反馈：表格字体小）。
+        # pt/行高显式乘窗口缩放系数，对齐 CTk 控件视觉
+        #（不走 root._get_widget_scaling：主窗该属性初始化时序不稳，实测炸）
+        try:
+            scale = ctk.ScalingTracker.get_window_scaling(self.root)
+        except Exception:
+            scale = 1.0
         style.configure("Dgpu.Treeview", fieldbackground=SURFACE,
                         background=SURFACE, foreground=TEXT,
-                        rowheight=28, borderwidth=0,
-                        font=(FONT_FAMILY, 10))
+                        rowheight=int(34 * scale), borderwidth=0,
+                        font=(FONT_FAMILY, round(12 * scale)))
         style.configure("Dgpu.Treeview.Heading", background=SURFACE2,
-                        foreground=MUTED, relief="flat", borderwidth=0,
-                        font=(FONT_FAMILY, 10, "bold"))
+                        foreground="#c9d1d9", relief="flat", borderwidth=0,
+                        font=(FONT_FAMILY, round(12 * scale), "bold"))
         style.map("Dgpu.Treeview",
                   background=[("selected", ACCENT_DARK)],
                   fieldbackground=[("selected", ACCENT_DARK)])
@@ -354,12 +398,14 @@ class App:
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                  selectmode="browse", style="Dgpu.Treeview")
         for cid, text, w, anchor in (
-                ("gpu", "显卡", 150, "w"), ("pid", "PID", 60, "e"),
-                ("name", "进程", 140, "w"), ("local", "显存(MB)", 80, "e"),
-                ("nonlocal", "共享(MB)", 80, "e"), ("committed", "提交(MB)", 80, "e"),
-                ("engines", "引擎活动", 210, "w"), ("nvmods", "NV 模块", 160, "w")):
+                ("gpu", "显卡", 178, "w"), ("pid", "PID", 70, "e"),
+                ("name", "进程", 150, "w"), ("local", "显存(MB)", 88, "e"),
+                ("nonlocal", "共享(MB)", 88, "e"), ("committed", "提交(MB)", 88, "e"),
+                ("engines", "引擎活动", 200, "w"), ("nvmods", "NV 模块", 190, "w")):
             self.tree.heading(cid, text=text)
-            self.tree.column(cid, width=w, anchor=anchor,
+            # 列宽同样乘缩放：字体放大后固定列宽会截断数值/表头
+            #（1251x 五位 PID 只剩四位、表头「显存(MB)」剩「显存(M」，2026-11-17 截图实测）
+            self.tree.column(cid, width=int(w * scale), anchor=anchor,
                              stretch=(cid in ("name", "engines", "nvmods")))
         ysb = ctk.CTkScrollbar(tree_frame, orientation="vertical",
                                command=self.tree.yview)
@@ -370,7 +416,7 @@ class App:
         self.detail = ctk.CTkLabel(
             tree_frame, text="选中进程后这里显示完整路径与引擎明细",
             wraplength=980, anchor="w", justify="left", text_color=MUTED,
-            font=(FONT_FAMILY, 11), fg_color=SURFACE,
+            font=(FONT_FAMILY, 12), fg_color=SURFACE,
             corner_radius=6, padx=8, pady=3)
         self.detail.pack(side="bottom", fill="x")
         self.detail.bind(
@@ -382,7 +428,7 @@ class App:
                                 foreground=YELLOW)              # 新持有高亮
         self.tree.tag_configure("igpu", background="#141d2e")    # 核显行
         self.tree.tag_configure("nvdrv", background="#191430")   # 驱动层口径行
-        self.tree.tag_configure("odd", background="#12161d")     # 斑马纹
+        self.tree.tag_configure("odd", background="#1c2128")     # 斑马纹（够读出隔行又不喧宾）
         # 系统/服务组件：警示黄（整行红是红色滥用，黄=「不建议结束」的份量）
         self.tree.tag_configure("prot", foreground=YELLOW)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -391,8 +437,9 @@ class App:
         self.pw.add(tree_frame, weight=3)
         self._build_log_pane(self.pw)
         # 初始 sash 位置：表格为主（requested 高度只随首帧行数走，行少时
-        # 日志区会反客为主，显式定表 320/日志余量，用户仍可拖）
-        self.root.after(200, lambda: self.pw.sashpos(0, 320))
+        # 日志区会反客为主；行高放大后 ~12 行需要更多纵向空间，
+        # sash 同步乘缩放），用户仍可拖
+        self.root.after(200, lambda: self.pw.sashpos(0, int(420 * scale)))
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
@@ -401,23 +448,24 @@ class App:
         sb.columnconfigure(0, weight=1)
         self.mode_badge = ctk.CTkLabel(sb, text=" … ", corner_radius=10,
                                        fg_color=SURFACE2, text_color=TEXT,
-                                       padx=12, pady=3, font=(FONT_FAMILY, 11))
+                                       padx=12, pady=3, font=(FONT_FAMILY, 12))
         self.mode_badge.grid(row=0, column=0, sticky="w")
         admin = "管理员 ✓" if eng.is_admin() else "管理员 ✗（杀提权进程/切换需提权）"
         self.admin_label = ctk.CTkLabel(
-            sb, text=admin, font=(FONT_FAMILY, 11),
+            sb, text=admin, font=(FONT_FAMILY, 12),
             text_color=(GREEN if eng.is_admin() else RED))
         self.admin_label.grid(row=0, column=1, sticky="e")
         self.refresh_label = ctk.CTkLabel(sb, text="", text_color=MUTED,
-                                          font=(FONT_FAMILY, 11))
+                                          font=(FONT_FAMILY, 12))
         self.refresh_label.grid(row=0, column=2, sticky="e", padx=(10, 0))
         self.evidence = ctk.CTkLabel(sb, text="三凭证读取中…", text_color=MUTED,
-                                     font=(FONT_FAMILY, 11))
+                                     font=(FONT_FAMILY, 12))
         self.evidence.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         self.menu = tk.Menu(self.root, tearoff=0,
                             bg=SURFACE2, fg=TEXT, activebackground=ACCENT_DARK,
-                            activeforeground=TEXT, bd=0)
+                            activeforeground=TEXT, bd=0,
+                            font=(FONT_FAMILY, 12))
         self.menu.add_command(label="结束进程树（PID）", command=lambda: self._kill(by_pid=True))
         self.menu.add_command(label="结束全部同名进程（含子进程树）", command=lambda: self._kill(by_pid=False))
         self.menu.add_separator()
@@ -436,7 +484,7 @@ class App:
                            command=self._open_log_dir).pack(side="left", padx=6)
         ctk.CTkLabel(topbar, text="切换按钮在上方运行完整切换编排，"
                                   "输出同步留档 logs/（eco_/hybrid_/direct_）",
-                     text_color=MUTED, font=(FONT_FAMILY, 11)).pack(
+                     text_color=MUTED, font=(FONT_FAMILY, 12)).pack(
             side="left", padx=6)
 
         body = ctk.CTkFrame(frame, fg_color="transparent")
@@ -501,29 +549,35 @@ class App:
     # ------------------------------------------------------------- 主线程轮询
 
     def _poll(self):
+        # 处理段整体兜底：任何一条消息/日志渲染异常都不得杀死 after 重排——
+        # 曾经 _drain_log 一个 AttributeError 就冻结整条事件链（日志不显示、
+        # 快照停更、问答框弹不出，2026-11-17 真机事故）
         try:
-            while True:
-                kind, *rest = self.q.get_nowait()
-                if kind == "snap":
-                    self._apply_snapshot(rest[0], rest[1])
-                elif kind == "err":
-                    self.log_q.put(rest[0] + "\n")
-                elif kind == "ask":
-                    self._show_ask(rest[0])
-                elif kind == "ecodone":
-                    self._on_ecodone(rest[0], rest[1])
-                elif kind == "nvtab":
-                    self._apply_nvtab(rest[0])
-                elif kind == "gcuinfo":
-                    self.gcu_info = rest[0]
-                    self._update_switch_buttons()
-                elif kind == "gcu_intent":
-                    self._gcu_direct_cache, self._gcu_igpu_cache = rest[0], rest[1]
-                    if self.last_st is not None:
-                        self._apply_status(self.last_st)  # 意图到了，重判四态
-        except queue.Empty:
-            pass
-        self._drain_log()
+            try:
+                while True:
+                    kind, *rest = self.q.get_nowait()
+                    if kind == "snap":
+                        self._apply_snapshot(rest[0], rest[1])
+                    elif kind == "err":
+                        self.log_q.put(rest[0] + "\n")
+                    elif kind == "ask":
+                        self._show_ask(rest[0])
+                    elif kind == "ecodone":
+                        self._on_ecodone(rest[0], rest[1])
+                    elif kind == "nvtab":
+                        self._apply_nvtab(rest[0])
+                    elif kind == "gcuinfo":
+                        self.gcu_info = rest[0]
+                        self._update_switch_buttons()
+                    elif kind == "gcu_intent":
+                        self._gcu_direct_cache, self._gcu_igpu_cache = rest[0], rest[1]
+                        if self.last_st is not None:
+                            self._apply_status(self.last_st)  # 意图到了，重判四态
+            except queue.Empty:
+                pass
+            self._drain_log()
+        except Exception:
+            self.log_q.put(traceback.format_exc() + "\n")
         self.root.after(self.POLL_MS, self._poll)
 
     def _gcu_probe_once(self):
@@ -692,13 +746,13 @@ class App:
                          text_color=TEXT, font=(FONT_FAMILY, 12, "bold")).grid(
                 row=0, column=1, sticky="w", padx=(0, 14))
             mem_l = ctk.CTkLabel(f, text="显存 …", text_color=MUTED,
-                                 font=(FONT_FAMILY, 11))
+                                 font=(FONT_FAMILY, 12))
             mem_l.grid(row=0, column=2, sticky="w", padx=(0, 10))
             pbar = ctk.CTkProgressBar(f, height=5, corner_radius=3,
                                       fg_color=SURFACE2, progress_color=ACCENT)
             pbar.grid(row=0, column=3, sticky="ew", pady=2)
             eng_l = ctk.CTkLabel(f, text="…", text_color=MUTED,
-                                 font=(FONT_FAMILY, 11))
+                                 font=(FONT_FAMILY, 12))
             eng_l.grid(row=0, column=4, sticky="w", padx=(14, 12))
             f.columnconfigure(3, weight=1)  # 占用条吸收余宽
             self.chips[luid] = (mem_l, eng_l, pbar)
@@ -863,6 +917,14 @@ class App:
         """
         if self.switch_running:
             return
+        # 当前态点击 = 落一行日志反馈，不静默（disabled 哑交互让咩咩以为
+        # 按钮坏了，2026-11-17 反馈；「点击必须有可感知响应」与取消同哲学）
+        mode = self.last_st.mode if self.last_st else "unknown"
+        already = {"dgpu_direct": "direct_on", "igpu_only": "on",
+                   "hybrid": "hybrid"}.get(mode)
+        if target == already:
+            self.log_q.put(f"[模式] 当前已是{MODE_NAMES[target]}，无需切换。\n")
+            return
         if target == "on" and not eng.is_admin():
             messagebox.showwarning(
                 "独显占用侦探",
@@ -878,8 +940,9 @@ class App:
         return (self.direct_on_btn, self.hybrid_btn, self.eco_on_btn)
 
     def _update_switch_buttons(self):
-        """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）；
-        态式配色：当前模式的按钮实色点亮，其余中性描边。"""
+        """按钮启用只按能力 gate（方案 §三 F）；当前态按钮保持可点，
+        点击由 run_switch 落日志「已在当前模式」反馈——disabled 哑交互
+        已废（2026-11-17 咩咩反馈）。态式配色：当前模式实色点亮，其余中性描边。"""
         mode = self.last_st.mode if self.last_st else "unknown"
         active = {"dgpu_direct": "direct_on", "igpu_only": "on",
                   "hybrid": "hybrid"}.get(mode)
@@ -894,14 +957,11 @@ class App:
         i = self.gcu_info
         eco_ok = not (i and i.igpu_only is False)
         direct_ok = not (i and i.dgpu_direct is False)
-        self.direct_on_btn.configure(
-            state="normal" if mode != "dgpu_direct" and direct_ok else "disabled")
-        # 混合模式在三种非混合态可点；走哪条路由 cmd_hybrid 现场判，
+        self.direct_on_btn.configure(state="normal" if direct_ok else "disabled")
+        # 混合模式恒可点；走哪条路由 cmd_hybrid 现场判，
         # 词表/能力细 gate 也在各分支里（同 CLI 口径）
-        self.hybrid_btn.configure(
-            state="normal" if mode in ("igpu_only", "dgpu_direct", "direct_pending")
-            else "disabled")
-        self.eco_on_btn.configure(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
+        self.hybrid_btn.configure(state="normal")
+        self.eco_on_btn.configure(state="normal" if eco_ok else "disabled")
 
     def _switch_worker(self, target: str):
         co_init()
@@ -1038,14 +1098,10 @@ class App:
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.GetParent(win.winfo_id())
-            style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-            user32.SetWindowLongW(hwnd, -20, style | 0x80000)  # WS_EX_LAYERED
+            user32.SetWindowLongW(hwnd, -20,
+                                  user32.GetWindowLongW(hwnd, -20) | 0x80000)  # WS_EX_LAYERED
             user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x2)  # LWA_ALPHA
-            val = ctypes.c_int(1)  # DWMWA_USE_IMMERSIVE_DARK_MODE
-            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, 20, ctypes.byref(val), ctypes.sizeof(val)) != 0:
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))  # 20H1 前
+            _dwm_dark_titlebar(hwnd)
         except Exception:
             pass
         win.grab_set()
@@ -1127,11 +1183,11 @@ class App:
                 s = self.log_q.get_nowait()
             except queue.Empty:
                 break
-            self.log_text.config(state="normal")
+            self.log_text.configure(state="normal")
             self.log_text.insert("end", s)
             if int(self.log_text.index("end-1c").split(".")[0]) > 3000:
                 self.log_text.delete("1.0", "500.0")
-            self.log_text.config(state="disabled")
+            self.log_text.configure(state="disabled")
             if at_bottom:
                 self.log_text.see("end")
             n += 1
@@ -1139,9 +1195,9 @@ class App:
                 break
 
     def _clear_log(self):
-        self.log_text.config(state="normal")
+        self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
-        self.log_text.config(state="disabled")
+        self.log_text.configure(state="disabled")
 
     def _open_log_dir(self):
         os.startfile(os.path.dirname(eng.eco_log_path()))  # 顺带建目录
@@ -1176,16 +1232,31 @@ def _move_offscreen(root: ctk.CTk) -> None:
         pass
 
 
-def _dark_titlebar(root: ctk.CTk) -> None:
-    """主窗 DWM 深色标题栏/边框（CTk 自带的设置实测未生效，截图左缘浅色带）。"""
+def _dwm_dark_titlebar(hwnd: int, bg: str = BG) -> None:
+    """DWM 深色标题栏/边框/标题文字（主窗与问答窗共用）。
+    IMMERSIVE_DARK_MODE(20/19) 在本机 build 26300 实测不生效（真机标题栏
+    仍系统蓝，2026-11-17 咩咩截图），改为 Win11 的 CAPTION/BORDER/TEXT
+    三色直涂（22000+），涂不动（旧系统）再回退 attribute 20/19。"""
     try:
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetParent(root.winfo_id())
-        val = ctypes.c_int(1)  # DWMWA_USE_IMMERSIVE_DARK_MODE
-        if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 20, ctypes.byref(val), ctypes.sizeof(val)) != 0:
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))  # 20H1 前
+        dwm = ctypes.windll.dwmapi
+        r, g, b = (int(bg[i:i + 2], 16) for i in (1, 3, 5))
+        caption = (b << 16) | (g << 8) | r          # COLORREF 0x00BBGGRR
+        r, g, b = 0xE6, 0xED, 0xF3                  # TEXT 色 = 主文字色
+        text_c = (b << 16) | (g << 8) | r
+        for attr, val in ((35, caption), (34, caption), (36, text_c)):
+            dwm.DwmSetWindowAttribute(hwnd, attr,
+                                      ctypes.byref(ctypes.c_int(val)), 4)
+        v = ctypes.c_int(1)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+        if dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), 4) != 0:
+            dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(v), 4)  # 20H1 前
+    except Exception:
+        pass
+
+
+def _dark_titlebar(root: ctk.CTk) -> None:
+    """主窗 DWM 深色标题栏（CTk 自带的设置实测未生效，截图左缘浅色带）。"""
+    try:
+        _dwm_dark_titlebar(ctypes.windll.user32.GetParent(root.winfo_id()))
     except Exception:
         pass
 

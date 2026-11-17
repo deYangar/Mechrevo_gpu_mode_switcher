@@ -70,18 +70,28 @@ def main() -> int:
     m = re.search(r"\((True|False|None), 'gen\d+', '[^']*',", gi)
     check("gcu_info 五元组", bool(m), gi[:90])
 
-    # 6) 三按钮序 + 按态启停
+    # 6) 三按钮序 + 可点性（2026-11-17 交互改版：当前态不再 disabled，
+    # 点击由 run_switch 落日志反馈；disabled 只剩「能力不支持/切换中」）
     btns = next((l for l in lines if l.startswith("buttons:")), "")
     got = re.findall(r"(独显直连|混合模式|核显省电)=(normal|disabled)", btns)
     order_ok = [b[0] for b in got] == EXPECTED_BUTTONS
     check("三按钮序", order_ok, str([f"{b}={s}" for b, s in got]))
     states = dict(got)
-    # 至少一个 disabled 才证明「按态启停」在工作（混合态下混合模式禁用）
-    check("按态启停（存在 disabled）", "disabled" in states.values(), str(states))
+    check("至少一个按钮可点", "normal" in states.values(), str(states))
     check("cget('state') API 正常", all(s in ("normal", "disabled") for s in states.values()))
+    badge = next((l for l in lines if l.startswith("badge:")), "")
+    # 当前态按钮必须可点（徽章 ↔ 按钮一一对应；对应不上视为机器态特殊，跳过）
+    m_bdg = re.search(r"badge: '(.*?)' evidence:", badge)
+    if m_bdg:
+        bt = m_bdg.group(1)
+        cur = ("混合模式" if "混合" in bt else
+               "独显直连" if "直连" in bt else
+               "核显省电" if ("省电" in bt or "核显" in bt) else None)
+        if cur:
+            check("当前态按钮可点（非 disabled）", states.get(cur) == "normal",
+                  f"badge={bt!r} → {cur}={states.get(cur)}")
 
     # 7) 徽章/三凭证文本
-    badge = next((l for l in lines if l.startswith("badge:")), "")
     check("徽章文本非空", "badge: '" in badge and len(badge) > len("badge: ''"), badge[:60])
     ev = next((l for l in lines if "evidence:" in l), "")
     check("三凭证含内屏/PnP/DXGI", all(k in ev for k in ("内屏", "PnP", "DXGI")), ev[:80])
