@@ -204,36 +204,48 @@ class App:
         self.gpu_bar.grid(row=0, column=0, sticky="ew")
 
         # 工具条
-        bar = ttk.Frame(self.root, padding=(10, 2))
-        bar.grid(row=1, column=0, sticky="ew")
+        bar = ctk.CTkFrame(self.root, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", padx=10, pady=2)
 
         self.auto_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="自动刷新", variable=self.auto_var,
+        ctk.CTkCheckBox(bar, text="自动刷新", variable=self.auto_var,
                         command=self._on_auto_toggle).pack(side="left")
-        ttk.Label(bar, text="间隔(s)").pack(side="left", padx=(10, 2))
-        self.interval_spin = ttk.Spinbox(bar, from_=0.5, to=10.0, increment=0.5,
-                                         width=4, command=self._on_interval)
+        ctk.CTkLabel(bar, text="间隔(s)").pack(side="left", padx=(10, 2))
+        # CTk 无 Spinbox：ComboBox 可输可选兜住（预设 0.5~10.0 步进 0.5，
+        # 手输其他值仍按 _on_interval 的 0.5~10 校验收）
+        self.interval_spin = ctk.CTkComboBox(
+            bar, values=[f"{0.5 * i:.1f}" for i in range(1, 21)], width=88,
+            height=28, command=self._on_interval)
         self.interval_spin.set("1.0")
         self.interval_spin.pack(side="left")
         self.interval_spin.bind("<FocusOut>", lambda e: self._on_interval())
-        ttk.Button(bar, text="立即刷新", command=self._refresh_now).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="立即刷新", width=88, height=28,
+                      command=self._refresh_now).pack(side="left", padx=6)
         self.all_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="含核显", variable=self.all_var,
+        ctk.CTkCheckBox(bar, text="含核显", variable=self.all_var,
                         command=self._on_include_all).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="导出 JSON", command=self._export_json).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="导出 JSON", width=88, height=28,
+                      command=self._export_json).pack(side="left", padx=6)
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ctk.CTkFrame(bar, width=2, corner_radius=0,
+                     fg_color="#3a3a3a").pack(side="left", fill="y", padx=8)
         # 按性能排：独显直连（独显全力）→ 混合模式 → 核显省电（独显下线）；
         # 混合模式 = 目标态入口，cmd_hybrid 按当前态自动挑路
-        # （省电态走 MQTT 回线、直连态走 MUX 重启），曾是两个互斥按钮
-        self.direct_on_btn = ttk.Button(bar, text="独显直连",
-                                        command=lambda: self.run_switch("direct_on"))
+        # （省电态走 MQTT 回线、直连态走 MUX 重启三选），曾是两个互斥按钮
+        self.direct_on_btn = ctk.CTkButton(
+            bar, text="独显直连", width=96, height=28,
+            fg_color="#6a3fa0", hover_color="#59348a",
+            command=lambda: self.run_switch("direct_on"))
         self.direct_on_btn.pack(side="left")
-        self.hybrid_btn = ttk.Button(bar, text="混合模式",
-                                     command=lambda: self.run_switch("hybrid"))
+        self.hybrid_btn = ctk.CTkButton(
+            bar, text="混合模式", width=96, height=28,
+            fg_color="#1f6aa5", hover_color="#1a5789",
+            command=lambda: self.run_switch("hybrid"))
         self.hybrid_btn.pack(side="left", padx=6)
-        self.eco_on_btn = ttk.Button(bar, text="核显省电",
-                                     command=lambda: self.run_switch("on"))
+        self.eco_on_btn = ctk.CTkButton(
+            bar, text="核显省电", width=96, height=28,
+            fg_color="#2f7d4f", hover_color="#276a42",
+            command=lambda: self.run_switch("on"))
         self.eco_on_btn.pack(side="left")
 
         # 中央：上持有者表格 / 下 Notebook，可拖分界
@@ -728,20 +740,20 @@ class App:
         """按当前态与能力启用按钮（方案 §三 F：按态与能力启用）。"""
         if self.switch_running:
             for b in self._switch_buttons():
-                b.config(state="disabled")
+                b.configure(state="disabled")
             return
         mode = self.last_st.mode if self.last_st else "unknown"
         i = self.gcu_info
         eco_ok = not (i and i.igpu_only is False)
         direct_ok = not (i and i.dgpu_direct is False)
-        self.direct_on_btn.config(
+        self.direct_on_btn.configure(
             state="normal" if mode != "dgpu_direct" and direct_ok else "disabled")
         # 混合模式在三种非混合态可点；走哪条路由 cmd_hybrid 现场判，
         # 词表/能力细 gate 也在各分支里（同 CLI 口径）
-        self.hybrid_btn.config(
+        self.hybrid_btn.configure(
             state="normal" if mode in ("igpu_only", "dgpu_direct", "direct_pending")
             else "disabled")
-        self.eco_on_btn.config(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
+        self.eco_on_btn.configure(state="normal" if mode != "igpu_only" and eco_ok else "disabled")
 
     def _switch_worker(self, target: str):
         co_init()
@@ -897,7 +909,7 @@ class App:
         gi = self.gcu_info
         lines.append(f"gcu_info: {None if gi is None else (gi.connected, gi.generation, gi.client_id, gi.igpu_only, gi.dgpu_direct)}")
         lines.append("buttons: " + ",".join(
-            f"{str(b.cget('text'))}={b.state()}" for b in self._switch_buttons()))
+            f"{str(b.cget('text'))}={b.cget('state')}" for b in self._switch_buttons()))
         lines.append(f"badge: {self.mode_badge.cget('text')!r} evidence: {self.evidence.cget('text')!r}")
         # 状态栏几何：验证两行布局（evidence 须在徽章下一行且占全宽；
         # 单行回退时两者 y 相等）
