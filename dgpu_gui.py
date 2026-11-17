@@ -70,13 +70,13 @@ def short_gpu(name: str) -> str:
     return n if len(n) <= 26 else n[:25] + "…"
 
 
-MODE_COLORS = {  # 徽章配色：fg, bg
-    "hybrid": ("#1a6b2f", "#e0f2e2"),
-    "igpu_only": ("#1a4fa0", "#e2ecfa"),
-    "pnp_disabled": ("#8a5200", "#fbeed8"),
-    "dgpu_direct": ("#5b2a86", "#efe6fa"),
-    "direct_pending": ("#a05a00", "#fdf0d5"),
-    "unknown": ("#9c1f1f", "#fae2e2"),
+MODE_COLORS = {  # 徽章配色（深色主题）：fg 文字, bg 底
+    "hybrid": ("#86e29b", "#1f5130"),
+    "igpu_only": ("#8fc4ff", "#1d3a6b"),
+    "pnp_disabled": ("#ffcf8f", "#6b4a1a"),
+    "dgpu_direct": ("#d4b3ff", "#4a2a6b"),
+    "direct_pending": ("#ffe08f", "#6b551a"),
+    "unknown": ("#ff9f9f", "#6b1f1f"),
 }
 
 
@@ -279,18 +279,21 @@ class App:
 
         # 底部状态栏（两行）：上行=模式徽章＋管理员＋刷新时间，下行=三凭证独占全宽
         # （单行布局下窗口一窄，三凭证后半截被右侧元素挤没）
-        sb = ttk.Frame(self.root, padding=(10, 2, 10, 6))
-        sb.grid(row=3, column=0, sticky="ew")
+        sb = ctk.CTkFrame(self.root, fg_color="transparent")
+        sb.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 6))
         sb.columnconfigure(0, weight=1)
-        self.mode_badge = tk.Label(sb, text=" … ", bg="#eeeeee", fg="#333",
-                                   padx=10, pady=2)
+        self.mode_badge = ctk.CTkLabel(sb, text=" … ", corner_radius=8,
+                                       fg_color="#3a3a3a", text_color="#dce4ee",
+                                       padx=10, pady=2)
         self.mode_badge.grid(row=0, column=0, sticky="w")
         admin = "管理员 ✓" if eng.is_admin() else "管理员 ✗（杀提权进程/切换需提权）"
-        self.admin_label = ttk.Label(sb, text=admin, foreground=("#1a6b2f" if eng.is_admin() else "#9c1f1f"))
+        self.admin_label = ctk.CTkLabel(
+            sb, text=admin,
+            text_color=("#86e29b" if eng.is_admin() else "#ff9f9f"))
         self.admin_label.grid(row=0, column=1, sticky="e")
-        self.refresh_label = ttk.Label(sb, text="", foreground="#666")
+        self.refresh_label = ctk.CTkLabel(sb, text="", text_color="#8a94a3")
         self.refresh_label.grid(row=0, column=2, sticky="e", padx=(10, 0))
-        self.evidence = ttk.Label(sb, text="三凭证读取中…", foreground="#444")
+        self.evidence = ctk.CTkLabel(sb, text="三凭证读取中…", text_color="#8a94a3")
         self.evidence.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         self.menu = tk.Menu(self.root, tearoff=0)
@@ -466,7 +469,7 @@ class App:
         nv_only = self._nv_only_count()
         nv_extra = f"｜ 驱动层 {nv_only}" if nv_only else ""
         extra = f"｜ 新持有 {new_count}" if new_count else ""
-        self.refresh_label.config(
+        self.refresh_label.configure(
             text=f"{time.strftime('%H:%M:%S')} · {rows_total} 持有{extra}{nv_extra}")
 
         # 后台自测钩子：首帧数据就绪后自动选中首行（只读操作）
@@ -556,7 +559,8 @@ class App:
             st.gcu_igpu_status = self._gcu_igpu_cache
         mode = st.mode
         fg, bg = MODE_COLORS.get(mode, MODE_COLORS["unknown"])
-        self.mode_badge.config(text=f" {eng.MODE_LABELS.get(mode, mode)} ", fg=fg, bg=bg)
+        self.mode_badge.configure(text=f" {eng.MODE_LABELS.get(mode, mode)} ",
+                                  text_color=fg, fg_color=bg)
         panel = {"discrete": "内屏:独显", "integrated": "内屏:核显"}.get(st.panel, "内屏:未知")
         probs = "; ".join(eng.STATE_LABELS.get(p, p).split("（")[0] for _, p in st.problems)
         probs = f"PnP: {probs}" if probs else "PnP: 不可读"
@@ -579,7 +583,7 @@ class App:
             icap = {True: "✓", False: "✗", None: "?"}.get(i.igpu_only, "?")
             caps = (f"  ｜  Gen{i.generation.removeprefix('gen') or '?'}"
                     f" 直连{dcap} 省电{icap}")
-        self.evidence.config(text=f"{panel}  ｜  {probs}  ｜  {dxgi}  ｜  {intent}"
+        self.evidence.configure(text=f"{panel}  ｜  {probs}  ｜  {dxgi}  ｜  {intent}"
                                   f"{gcu_intent}{caps}")
         self._update_switch_buttons()
 
