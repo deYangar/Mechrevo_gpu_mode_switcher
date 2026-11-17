@@ -2341,6 +2341,11 @@ def cmd_hybrid() -> int:
 
 
 def main() -> int:
+    # pythonw / 无控制台运行（run_eco_yes.ps1 提权无人值守）：stdio 为 None，
+    # print 直接炸——兜底为丢弃流；编排输出本就由 _Tee 双写 logs/ 留档
+    for _name in ("stdout", "stderr"):
+        if getattr(sys, _name, None) is None:
+            setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
     ap = argparse.ArgumentParser(
         description="识别哪个进程在占用独立显卡（WDDM 性能计数器，任务管理器同款数据）")
     ap.add_argument("--list-gpus", action="store_true", help="列出所有显卡适配器后退出")

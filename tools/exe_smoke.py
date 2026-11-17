@@ -4,8 +4,8 @@ r"""exe 冒烟测试（提权运行）：launch → 找窗口 → 屏幕外断�
 6 秒存活（采样线程跑着）；WM_CLOSE 干净退出。
 被测 exe 带 uac-admin 清单，本脚本也必须提权跑，否则 UIPI 挡 PrintWindow/PostMessage。
 
-用法（外部用 Start-Process -Verb RunAs 提权启动）：
-  python tools/exe_smoke.py            # 测 dist\dgpu_detective.exe
+用法（外部用 Start-Process -Verb RunAs 提权启动，pythonw 无控制台）：
+  pythonw tools\exe_smoke.py           # 测 dist\dgpu_detective.exe
 结果写 test_artifacts\exe_smoke_result.txt，退出码 0=全过。
 """
 
@@ -18,6 +18,13 @@ import sys
 import time
 import zlib
 from ctypes import wintypes
+
+# pythonw（无控制台）提权跑：sys.stdout/stderr 为 None，print 会炸——
+# 兜底为丢弃流（结果走 test_artifacts\exe_smoke_result.txt 文件回传，
+# 终端输出从来就不需要）
+for _name in ("stdout", "stderr"):
+    if getattr(sys, _name, None) is None:
+        setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(PROJ, "dist", "dgpu_detective.exe")
