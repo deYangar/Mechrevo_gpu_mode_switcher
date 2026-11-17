@@ -1027,10 +1027,26 @@ def _move_offscreen(root: ctk.CTk) -> None:
         pass
 
 
+def _dark_titlebar(root: ctk.CTk) -> None:
+    """主窗 DWM 深色标题栏/边框（CTk 自带的设置实测未生效，截图左缘浅色带）。"""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(root.winfo_id())
+        val = ctypes.c_int(1)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+        if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(val), ctypes.sizeof(val)) != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))  # 20H1 前
+    except Exception:
+        pass
+
+
 def main() -> int:
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()
+    root.update_idletasks()
+    _dark_titlebar(root)
     try:
         adapters = eng.enumerate_adapters()
     except OSError as e:
