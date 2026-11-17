@@ -87,6 +87,13 @@ def _write_png(path, w, h, bgra: bytes):
 
 
 def screenshot_png(hwnd, path) -> tuple:
+    """PrintWindow 自适应双发：先 PW_RENDERFULLCONTENT(2)（走 DWM 合成表面，
+    正常会话下的主路径）；整幅单色（屏外/锁屏等 DWM 无表面的场合）再用
+    PW_CLIENTONLY(1) 的 WM_PRINT 消息路径兜底——逐控件自画，动态创建的
+    CTk canvas 也能画，但需要前一发 PrintWindow 暖场（首次单发抓到白板，
+    2026-11-17 CTk 迁移实测：解锁态 flag2 直出 / 锁屏态 flag2 白 flag1 可画）。
+    """
+    PW_CLIENTONLY = 1
     PW_RENDERFULLCONTENT = 2
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
@@ -98,19 +105,43 @@ def screenshot_png(hwnd, path) -> tuple:
     hbmp = gdi32.CreateCompatibleBitmap(hdc_win, w, h)
     gdi32.SelectObject(hdc_mem, hbmp)
     try:
-        if not user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT):
-            return False, "PrintWindow 失败"
         bi = ctypes.create_string_buffer(40)
         struct.pack_into("IiiHHIIiiII", bi, 0, 40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
         buf = ctypes.create_string_buffer(w * h * 4)
-        if not gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, bi, 0):
-            return False, "GetDIBits 失败"
-        raw = buf.raw[: w * h * 4]
-        lo, hi = min(raw), max(raw)
-        if lo == hi:
-            return False, "截图疑似空白（整幅单色）"
+        raw, lo, hi, used = None, None, None, "?"
+
+        def content_ok(cand) -> bool:
+            """整幅单色=没画；纯白占比过高=局部未绘制（PrintWindow 未画区
+            是未初始化位图的纯 255 白）。阈值 253：浅色日志面板 #fbfbfb(251)
+            这类真实内容不算未绘制。"""
+            n = w * h
+            step = 64  # 每 16 像素采 1 个，够判定
+            total = len(range(0, n * 4, step))
+            blank = 0
+            for i in range(0, n * 4, step):
+                if cand[i] >= 253 and cand[i + 1] >= 253 and cand[i + 2] >= 253:
+                    blank += 1
+            return blank / total < 0.30
+
+        # 序列：WM_PRINT 完整版（0）优先——配合被测窗口的 LAYERED+alpha=1
+        # 钩子（见 dgpu_gui._move_offscreen）一次画全；DWM 表面路径兜底
+        seq = ((0, "wmprint"), (PW_RENDERFULLCONTENT, "fullcontent"))
+        for i, (flag, tag) in enumerate(seq):
+            if i:
+                time.sleep(0.2)  # 给 tk 主线程一轮消息循环
+            if not user32.PrintWindow(hwnd, hdc_mem, flag):
+                continue
+            if not gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, bi, 0):
+                continue
+            cand = buf.raw[: w * h * 4]
+            c_lo, c_hi = min(cand), max(cand)
+            if c_lo != c_hi and content_ok(cand):
+                raw, lo, hi, used = cand, c_lo, c_hi, tag
+                break
+        if raw is None:
+            return False, "截图疑似空白或大面积未绘制"
         _write_png(path, w, h, raw)
-        return True, f"{w}x{h} 字节极值 {lo}..{hi}"
+        return True, f"{w}x{h} 字节极值 {lo}..{hi} 路径={used}"
     finally:
         gdi32.DeleteObject(hbmp)
         gdi32.DeleteDC(hdc_mem)

@@ -252,11 +252,25 @@ class App:
         pw = ttk.PanedWindow(self.root, orient="vertical")
         pw.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
 
-        tree_frame = ttk.Frame(pw)
+        tree_frame = ctk.CTkFrame(pw, fg_color="transparent")
+        # ttk.Treeview 深色化一处配置（clam 主题才吃 fieldbackground；
+        # 默认 vista/w11 主题的 Treeview 配色改不动）
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("Dgpu.Treeview", fieldbackground="#2b2b2b",
+                        background="#2b2b2b", foreground="#dce4ee",
+                        rowheight=26, borderwidth=0)
+        style.configure("Dgpu.Treeview.Heading", background="#3a3a3a",
+                        foreground="#cfd8e3", relief="flat", borderwidth=0,
+                        font=("TkDefaultFont", 9, "bold"))
+        style.map("Dgpu.Treeview",
+                  background=[("selected", "#22527e")],
+                  fieldbackground=[("selected", "#22527e")])
+        style.map("Dgpu.Treeview.Heading", background=[("active", "#454545")])
         cols = ("gpu", "pid", "name", "local", "nonlocal", "committed", "engines",
                 "nvmods")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
-                                 selectmode="browse")
+                                 selectmode="browse", style="Dgpu.Treeview")
         for cid, text, w, anchor in (
                 ("gpu", "显卡", 150, "w"), ("pid", "PID", 60, "e"),
                 ("name", "进程", 140, "w"), ("local", "显存(MB)", 80, "e"),
@@ -265,24 +279,26 @@ class App:
             self.tree.heading(cid, text=text)
             self.tree.column(cid, width=w, anchor=anchor,
                              stretch=(cid in ("name", "engines", "nvmods")))
-        ysb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        ysb = ctk.CTkScrollbar(tree_frame, orientation="vertical",
+                               command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
         # 明细条必须最先 pack（pack 按顺序分配空间）：先占满底部整行，
         # 表格和滚动条再填剩余——若表格先 pack 且 expand，整行宽度被吃光，
         # 明细只剩右侧零头，默认窗口宽度下被挤成一条竖缝、路径全截断
-        self.detail = ttk.Label(tree_frame, text="选中进程后这里显示完整路径与引擎明细",
-                                padding=(2, 3), wraplength=980, anchor="w",
-                                foreground="#444")
+        self.detail = ctk.CTkLabel(
+            tree_frame, text="选中进程后这里显示完整路径与引擎明细",
+            wraplength=980, anchor="w", justify="left", text_color="#8a94a3")
         self.detail.pack(side="bottom", fill="x")
         self.detail.bind(
             "<Configure>",
             lambda e: self.detail.configure(wraplength=max(200, e.width - 8)))
         self.tree.pack(side="left", fill="both", expand=True)
         ysb.pack(side="right", fill="y")
-        self.tree.tag_configure("new", background="#fff3b2")     # 新持有高亮
-        self.tree.tag_configure("igpu", background="#eef4fd")    # 核显行
-        self.tree.tag_configure("nvdrv", background="#f4eefb")   # 驱动层口径行（WDDM 不可见）
-        self.tree.tag_configure("prot", foreground="#8a2f2f")    # 系统/服务组件
+        self.tree.tag_configure("new", background="#5a4d1a",
+                                foreground="#ffe08f")            # 新持有高亮
+        self.tree.tag_configure("igpu", background="#1c2a45")    # 核显行
+        self.tree.tag_configure("nvdrv", background="#35284a")   # 驱动层口径行（WDDM 不可见）
+        self.tree.tag_configure("prot", foreground="#ff8f8f")    # 系统/服务组件
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._popup_menu)
 
@@ -614,17 +630,17 @@ class App:
             return
         if m.get("nv_only"):
             mods = ", ".join(sorted(m["nv_mods"]))
-            self.detail.config(
+            self.detail.configure(
                 text=f"驱动层口径：{m['image']}  (pid {m['pid']})\n"
                      f"加载 {mods}  ｜  无图形上下文，WDDM 表不可见（传感器轮询类软件在此现形）",
-                foreground="#222")
+                text_color="#dce4ee")
             return
         active = {k: v for k, v in m["engines"].items() if v > 0.05}
         engines = "  ".join(f"{k} {v:.1f}%" for k, v in active.items()) or "仅上下文(0%)"
         prot = "  ｜ 系统/服务组件（保护名单，不建议结束）" if is_protected(m["image"]) else ""
-        self.detail.config(text=f"{m['image']}  (pid {m['pid']})\n"
-                                 f"显存 {m['local_mb']:.2f} MB  ｜  {engines}{prot}",
-                           foreground="#222")
+        self.detail.configure(text=f"{m['image']}  (pid {m['pid']})\n"
+                                   f"显存 {m['local_mb']:.2f} MB  ｜  {engines}{prot}",
+                              text_color="#dce4ee")
 
     def _popup_menu(self, ev):
         iid = self.tree.identify_row(ev.y)
@@ -966,14 +982,17 @@ class App:
 
 def _move_offscreen(root: ctk.CTk) -> None:
     """测试钩子（DGPU_TEST_OFFSCREEN=1）：窗口映射前移屏幕外 + 不进任务栏 +
-    不抢焦点——正常启动不触发。"""
+    不抢焦点——正常启动不触发。加 LAYERED+alpha=1：完全屏外的窗口没有 DWM
+    重定向表面，tk 的 GDI 输出无处落、PrintWindow 自测截图全白；layered
+    窗口自带 surface，alpha=1（255 分之一）视觉无感而绘制链路完整。"""
     root.update_idletasks()
     root.geometry("+30000+30000")
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.GetParent(root.winfo_id())
         style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-        user32.SetWindowLongW(hwnd, -20, style | 0x80 | 0x08000000)  # TOOLWINDOW | NOACTIVATE
+        user32.SetWindowLongW(hwnd, -20, style | 0x80 | 0x08000000 | 0x80000)  # TOOLWINDOW | NOACTIVATE | LAYERED
+        user32.SetLayeredWindowAttributes(hwnd, 0, 1, 0x2)  # LWA_ALPHA, alpha=1
     except Exception:
         pass
 

@@ -2,6 +2,8 @@ r"""源码 GUI 后台验证：launch（屏幕外）→ PrintWindow 截图 → WM
 
 与 exe_smoke.py 同一套 PrintWindow 手法，测的是源码版 python dgpu_gui.py——
 改完 GUI 代码先跑这个看渲染，再谈打包。
+被测窗口在 _move_offscreen 里挂了 LAYERED+alpha=1（屏外窗口无 DWM 表面，
+不挂则 PrintWindow 抓白板），本工具无需再操心绘制链路。
 
 用法：
   python tools/gui_verify.py
@@ -22,6 +24,11 @@ PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def main() -> int:
     os.makedirs(ART, exist_ok=True)
+    for n in ("gui_verify_t1.png", "gui_verify_t2.png"):  # 清上一轮产物，防误读旧图
+        try:
+            os.remove(os.path.join(ART, n))
+        except OSError:
+            pass
     pre = set(enum_windows())
     env = {**os.environ, "DGPU_TEST_OFFSCREEN": "1", "DGPU_TEST_AUTORUN": "1"}
     p = subprocess.Popen([sys.executable, os.path.join(PROJ, "dgpu_gui.py")],
