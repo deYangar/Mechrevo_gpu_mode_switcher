@@ -834,11 +834,19 @@ class App:
 
     def _show_ask(self, bridge: _AskBridge):
         prompt = (self._sink.pending if self._sink else "").strip() or "（控制台提问，详见日志）"
-        win = tk.Toplevel(self.root)
+        # 外壳用原生 Toplevel（旧版久经真机考验的窗口行为：显示/居中/grab）；
+        # CTkToplevel 在 Windows 下标题栏着色流程会撤回 withdrawn 初始态，
+        # 实测 mainloop 中窗口整个不出现。内容套一层 CTkFrame 深色容器：
+        # CTk 控件的 transparent 取父链 CTk 色，直接挂原生 Toplevel 会落回
+        # 主题默认浅色
+        win = tk.Toplevel(self.root, bg="#242424")
         win.title("切换问答")
         win.transient(self.root)
         win.resizable(False, False)
-        ttk.Label(win, text=prompt, wraplength=540, padding=14).pack()
+        holder = ctk.CTkFrame(win, fg_color="#242424", corner_radius=0)
+        holder.pack(fill="both", expand=True)
+        ctk.CTkLabel(holder, text=prompt, wraplength=540,
+                     justify="left").pack(padx=14, pady=14)
 
         def answer(v: str):
             bridge.ans_q.put(v)
@@ -849,17 +857,13 @@ class App:
         opts = re.findall(r"\[(\d+)\]\s*([^\[\]]+)", prompt)
         m_cancel = re.search(r"\[回车[^\]]*\]\s*([^\[\]]+)", prompt)
         if opts:
-            body = ttk.Frame(win)
+            body = ctk.CTkFrame(holder, fg_color="transparent")
             body.pack(padx=14, pady=(0, 12), fill="x")
             focused = None
-
-            def hook_enter(b: tk.Button):
-                b.bind("<Return>", lambda e: b.invoke())
-
             for num, desc in opts:
-                b = tk.Button(body, text=f"{num}｜{desc.strip()}", anchor="w",
-                              justify="left", wraplength=500, padx=10, pady=4,
-                              command=lambda n=num: answer(n))
+                b = ctk.CTkButton(body, text=f"{num}｜{desc.strip()}",
+                                  anchor="w", width=560,
+                                  height=32, command=lambda n=num: answer(n))
                 b.pack(fill="x", pady=3)
                 # 回车默认落在预期项（旧口径：重启三选焦点在 2=稍后自行重启，
                 # 一键回车不触发立即重启；清场确认仍默认 1）
@@ -867,18 +871,21 @@ class App:
                 if num == want:
                     focused = b
             cancel_desc = m_cancel.group(1).strip() if m_cancel else "取消切换"
-            cb = tk.Button(body, text=f"回车/其他｜{cancel_desc}", anchor="w",
-                           justify="left", wraplength=500, padx=10, pady=4,
-                           command=lambda: answer(""))
+            cb = ctk.CTkButton(body, text=f"回车/其他｜{cancel_desc}",
+                               anchor="w", width=560, height=32,
+                               command=lambda: answer(""))
             cb.pack(fill="x", pady=(3, 0))
             if focused:
                 focused.focus_set()
-                hook_enter(focused)
+                # 回车=默认安全侧：绑在问答窗上（焦点在窗内任何位置都生效；
+                # CTkButton 的 canvas 不吃键盘焦点，单绑按钮会漏）
+                win.bind("<Return>", lambda e: focused.invoke())
             win.bind("<Escape>", lambda e: answer(""))
         else:
-            entry = ttk.Entry(win, width=30)
+            entry = ctk.CTkEntry(holder, width=280)
             entry.pack(padx=14, pady=(0, 8))
-            ttk.Button(win, text="确定", command=lambda: answer(entry.get())).pack(pady=(0, 12))
+            ctk.CTkButton(holder, text="确定", width=88,
+                          command=lambda: answer(entry.get())).pack(pady=(0, 12))
             entry.bind("<Return>", lambda e: answer(entry.get()))
             entry.focus_set()
         # 居中于主窗口（Toplevel 默认落屏幕左上角，切换问答该跟着主窗走）
@@ -887,6 +894,22 @@ class App:
         rw, rh = self.root.winfo_width(), self.root.winfo_height()
         ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
         win.geometry(f"+{rx + max(0, (rw - ww) // 2)}+{ry + max(0, (rh - wh) // 3)}")
+        # LAYERED + alpha=255（完全不透明，视觉零差异）：layered 窗口自带
+        # 绘制表面，屏外自测 PrintWindow 才能抓全（同 _move_offscreen 的结论）；
+        # 顺带 DWM 深色标题栏（原生 Toplevel 默认系统浅色标题栏，与主题不搭）
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(win.winfo_id())
+            style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            user32.SetWindowLongW(hwnd, -20, style | 0x80000)  # WS_EX_LAYERED
+            user32.SetLayeredWindowAttributes(hwnd, 0, 255, 0x2)  # LWA_ALPHA
+            val = ctypes.c_int(1)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, ctypes.byref(val), ctypes.sizeof(val)) != 0:
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))  # 20H1 前
+        except Exception:
+            pass
         win.grab_set()
         win.protocol("WM_DELETE_WINDOW", lambda: answer(""))
 
