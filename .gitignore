@@ -5,6 +5,8 @@ logs/
 build/
 dist/
 test_artifacts/
+# 冷启动诊断：探针脚本与分段计时数据（2026-11-18 会话）
+cold_start_probe/
 # 探针与临时输出（口径验证用，已整合进主脚本；safe-rm 保护清单拒绝项目内删除，待拍板清理）
 nv_handle_probe.py
 mod_scan.py

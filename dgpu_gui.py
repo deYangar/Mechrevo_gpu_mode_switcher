@@ -64,6 +64,133 @@ def _patch_ctk_button_hitbox() -> None:
 _patch_ctk_button_hitbox()
 
 
+class _StartupTiming:
+    """启动分段打点（诊断冷启动慢），追加写文件。触发二选一：
+    - 环境变量 DGPU_TEST_TIMING=<路径>（自测脚本用）
+    - 标志文件 %LOCALAPPDATA%\\dgpu_detective_timing\\TIMING_ON 存在且内容
+      （epoch 秒）未过期 → 写同目录 timing_<时间戳>.txt。exe 双击场景没法
+      设环境变量，靠这个：放标志文件收集一次冷启动数据，看完删标志即静默。
+    每行「epoch\t+距进程创建秒数\t事件」，进程被杀也留得下已写段落。
+    不触发时全方法近零开销（一次路径判断）。rel 的 0 点对齐本进程创建
+    时刻；onefile 下另有 bootloader 父进程，其创建时刻≈双击时刻，
+    父→子差值≈解压+Defender 段（写在文件头，外部算差用）。"""
+
+    @staticmethod
+    def _resolve_path() -> str | None:
+        p = os.environ.get("DGPU_TEST_TIMING")
+        if p:
+            return p
+        base = os.path.join(os.path.expandvars("%LOCALAPPDATA%"),
+                            "dgpu_detective_timing")
+        try:
+            with open(os.path.join(base, "TIMING_ON"), encoding="utf-8") as f:
+                expiry = float(f.read().strip())
+        except (OSError, ValueError):
+            return None
+        if time.time() > expiry:
+            return None
+        return os.path.join(base, time.strftime("timing_%Y%m%d_%H%M%S.txt"))
+
+    def __init__(self):
+        self.path = self._resolve_path()
+        self._pc_birth = time.perf_counter()
+        self._done: set[str] = set()
+        self._lock = threading.Lock()
+        if not self.path:
+            return
+        created, parent = self._proc_creation_epochs()
+        if created is not None:
+            self._pc_birth = time.perf_counter() - (time.time() - created)
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(f"# self_created={created} parent_created={parent}\n")
+        except OSError:
+            self.path = None  # 写不进就不打点，别影响启动
+
+    @staticmethod
+    def _proc_creation_epochs() -> tuple[float | None, float | None]:
+        """(本进程, 父进程) 的创建时刻（epoch 秒）；拿不到返回 (None, None)。"""
+        try:
+            import ctypes.wintypes as wt
+
+            class FT(ctypes.Structure):
+                _fields_ = [("lo", wt.DWORD), ("hi", wt.DWORD)]
+
+            class PT(ctypes.Structure):
+                _fields_ = [("Creation", FT), ("Exit", FT),
+                            ("Kernel", FT), ("User", FT)]
+
+            class PBI(ctypes.Structure):
+                _fields_ = [("ExitStatus", wt.LONG), ("Peb", wt.LPVOID),
+                            ("Affinity", ctypes.c_size_t), ("BasePriority", wt.LONG),
+                            ("UniquePid", ctypes.c_size_t),
+                            ("ParentPid", ctypes.c_size_t)]
+
+            def epoch(ft: FT) -> float:
+                v = (ft.hi << 32) | ft.lo
+                return (v - 116444736000000000) / 1e7  # FILETIME(100ns) → epoch 秒
+
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wt.HANDLE  # 伪句柄 -1 不能被 c_int 截断
+            k32.GetProcessTimes.argtypes = ([wt.HANDLE] + [ctypes.POINTER(FT)] * 4)
+            k32.GetProcessTimes.restype = wt.BOOL
+            k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, ctypes.c_size_t]
+            k32.OpenProcess.restype = wt.HANDLE
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+            k32.NtQueryInformationProcess = ctypes.windll.ntdll.NtQueryInformationProcess
+            k32.NtQueryInformationProcess.argtypes = [
+                wt.HANDLE, wt.UINT, wt.LPVOID, wt.ULONG, ctypes.POINTER(wt.ULONG)]
+            mine = PT()
+            if not k32.GetProcessTimes(k32.GetCurrentProcess(),
+                                       ctypes.byref(mine.Creation),
+                                       ctypes.byref(mine.Exit),
+                                       ctypes.byref(mine.Kernel),
+                                       ctypes.byref(mine.User)):
+                return None, None
+            pbi = PBI()
+            if k32.NtQueryInformationProcess(
+                    k32.GetCurrentProcess(), 0, ctypes.byref(pbi),
+                    ctypes.sizeof(PBI), None) != 0:
+                return epoch(mine.Creation), None
+            hp = k32.OpenProcess(0x1000, False, pbi.ParentPid)  # QUERY_LIMITED
+            if not hp:
+                return epoch(mine.Creation), None
+            try:
+                pp = PT()
+                if not k32.GetProcessTimes(hp, ctypes.byref(pp.Creation),
+                                           ctypes.byref(pp.Exit),
+                                           ctypes.byref(pp.Kernel),
+                                           ctypes.byref(pp.User)):
+                    return epoch(mine.Creation), None
+                return epoch(mine.Creation), epoch(pp.Creation)
+            finally:
+                k32.CloseHandle(hp)
+        except Exception:
+            return None, None
+
+    def mark(self, name: str) -> None:
+        if not self.path:
+            return
+        rel = time.perf_counter() - self._pc_birth
+        try:
+            with self._lock:  # 主线程/采样线程/nv 线程并发 mark，open-append
+                with open(self.path, "a", encoding="utf-8") as f:  # 跨句柄非原子，会截行
+                    f.write(f"{time.time():.3f}\t+{rel:7.3f}\t{name}\n")
+        except OSError:
+            pass
+
+    def once(self, key: str, name: str) -> None:
+        """只打第一次的事件（首轮采样/首行渲染等循环事件用）。"""
+        if not self.path or key in self._done:
+            return
+        self._done.add(key)
+        self.mark(name)
+
+
+TIMING = _StartupTiming()
+TIMING.mark("dgpu_gui import 完成")
+
+
 # 模式名（日志反馈用）：与按钮文案一致
 MODE_NAMES = {"direct_on": "独显直连", "hybrid": "混合模式", "on": "核显省电"}
 
@@ -433,6 +560,13 @@ class App:
         ysb.pack(side="right", fill="y")
         self.tree.tag_configure("new", background="#3d2e12",
                                 foreground=YELLOW)              # 新持有高亮
+        # 空窗占位：首个快照渲染前表格是空白灰框，看不出「在加载」还是
+        # 「坏了」（开机首次 PDH 冷启动要等数秒）——占一行说明，_render_table
+        # 开头全清 get_children 时自动消失，无需显式撤
+        self.tree.tag_configure("boot", foreground=MUTED)
+        self.tree.insert("", "end", iid="boot", tags=("boot",), values=(
+            "⟳ 正在初始化采样……", "首帧数据就绪后自动显示；开机后首次打开需加载系统性能计数器，可能要等数秒",
+            "", "", "", "", "", ""))
         self.tree.tag_configure("igpu", background="#141d2e")    # 核显行
         self.tree.tag_configure("nvdrv", background="#191430")   # 驱动层口径行
         self.tree.tag_configure("odd", background="#1c2128")     # 斑马纹（够读出隔行又不喧宾）
@@ -574,11 +708,13 @@ class App:
 
     def _sampler_loop(self):
         co_init()
+        TIMING.mark("采样线程：开始打开 PDH 计数器")
         try:
             counters = eng.GpuCounters()
         except OSError as e:
             self.q.put(("err", f"PDH 计数器打开失败: {e}"))
             return
+        TIMING.mark("PDH 计数器就绪（AddEnglishCounter×6+打底采样）")
         try:
             while not self.stop_evt.is_set():
                 active = self._auto and not self._paused
@@ -608,6 +744,7 @@ class App:
         try:
             data = eng.sample_once(counters, self.adapters, self._include_all)
             st = eng.read_display_mode_state()
+            TIMING.once("snap", "首轮采样数据就绪")
             self.q.put(("snap", data, st))
         except Exception as e:
             self.q.put(("err", f"采样失败: {e!r}"))
@@ -654,6 +791,7 @@ class App:
         except Exception as e:
             self.log_q.put(f"（GCU 探测失败：{e!r}）\n")
             info = None
+        TIMING.once("gcu", "GCU 探测返回（能力角标就绪）")
         self.q.put(("gcuinfo", info))
 
     def _refresh_gcu_intent(self):
@@ -682,6 +820,7 @@ class App:
                     new_count += 1
         self.prev_keys = keys_now
         self._render_table()
+        TIMING.once("render", "表格首行数据上屏")
 
         # 高亮衰减（按采样轮次，不受 nv 重画加速）
         for iid in list(self.new_marks):
@@ -1216,6 +1355,7 @@ class App:
 
     def _apply_nvtab(self, rows):
         self.nv_rows = rows
+        TIMING.once("nv", f"首轮驱动层扫描到达（{len(rows)} 持有者）")
         if self.last_data:
             self._render_table()  # 自动刷新关闭时也立即并入表格
         # 后台自测钩子（DGPU_TEST_DUMP=路径）：nv 首轮到达后 10s 再 dump——
@@ -1355,6 +1495,7 @@ def main() -> int:
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk(fg_color=BG)  # 全窗底色：CTk dark 默认 #242424 换设计系统底色
+    TIMING.mark("CTk 窗口创建")
     apply_theme()
     root.update_idletasks()
     _dark_titlebar(root)
@@ -1364,8 +1505,11 @@ def main() -> int:
         root.withdraw()
         messagebox.showerror("独显占用侦探", f"DXGI 枚举失败: {e}")
         return 1
+    TIMING.mark(f"DXGI 枚举完成（{len(adapters)} 适配器）")
     app = App(root, adapters)
+    TIMING.mark("App 构建（UI+3 后台线程）")
     root.protocol("WM_DELETE_WINDOW", app._on_close)
+    root.after(1, lambda: TIMING.once("firstframe", "mainloop 首帧（窗口开始绘制）"))
     if os.environ.get("DGPU_TEST_OFFSCREEN") == "1":
         _move_offscreen(root)  # 必须在 mainloop 首次绘制前
     root.mainloop()
