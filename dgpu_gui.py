@@ -388,7 +388,7 @@ class App:
                      fg_color=BORDER).pack(side="left", fill="y", padx=10)
         # 按性能排：独显直连（独显全力）→ 混合模式 → 核显省电（独显下线）；
         # 混合模式 = 目标态入口，cmd_hybrid 按当前态自动挑路
-        # （省电态走 MQTT 回线、直连态走 MUX 重启三选），曾是两个互斥按钮。
+        # （省电态走 MQTT 让独显重新上线、直连态走 MUX 重启三选），曾是两个互斥按钮。
         # 态式：默认中性描边，当前模式的按钮由 _update_switch_buttons 点亮
         self.direct_on_btn = ctk.CTkButton(
             bar, text="独显直连", width=96, height=32,
@@ -1133,7 +1133,7 @@ class App:
         self._sink = sink
         titles = {
             "direct_on": "独显直连切换（探测 → 发令 → GCU 确认 → 重启三选）",
-            "hybrid": "回混合模式（按当前态自动路由：省电→MQTT 回线 / 直连→MUX 重启三选）",
+            "hybrid": "回混合模式（按当前态自动路由：省电→MQTT 让独显重新上线 / 直连→MUX 重启三选）",
             "on": "核显省电切换（混合态：清场+官方同款命令 / 直连态：MUX 重启直达；"
                   "无 MUX 档机型自动改走官方运行时省电）",
         }
