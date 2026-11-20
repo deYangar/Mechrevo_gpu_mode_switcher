@@ -1360,6 +1360,9 @@ def _dark_titlebar(root: ctk.CTk) -> None:
 
 
 def main() -> int:
+    # 带命令行参数启动（RunOnce 补账 --eco reconcile 等）：走引擎 CLI 分发，不弹 GUI
+    if len(sys.argv) > 1:
+        return eng.main()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk(fg_color=BG)  # 全窗底色：CTk dark 默认 #242424 换设计系统底色

@@ -1826,7 +1826,9 @@ def _eco_on_from_direct(st: DisplayModeState) -> int:
     choice = direct_restart_choice()
     if choice == "1":
         if not restart_countdown("仍会切换为核显省电"):
-            return 0  # 倒计时取消：命令已发，如实停在待重启态
+            runonce_set_reconcile()  # 倒计时取消：待重启态保持，重启后仍自动补账
+            return 0
+        runonce_set_reconcile()  # RESTART 后 1-2s 即断电，先登记补账再发令
         print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
         rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
         if rst != "ok":
@@ -1834,14 +1836,20 @@ def _eco_on_from_direct(st: DisplayModeState) -> int:
             print("  机器未重启；已处于待重启态，可稍后手动重启或重跑 --eco。")
             return 1
         print("  ✓ 重启命令已发出，机器即将重启。")
+        print("  （已登记重启后自动补账：登录时静默执行一次，官方控制台恢复识别省电态）")
         return 0
     if choice == "2":
+        runonce_set_reconcile()
         print("  保持待重启态：稍后自行重启即完成切换（--status 显示待重启态）。")
+        print("  （已登记重启后自动补账：登录时静默执行一次，官方控制台恢复识别省电态）")
         return 0
     # 取消撤回：发 TOGGLE_ON 翻回直连意图（IGPU 意图从没发过，无需撤）
-    return _direct_cancel_revert(
+    rc = _direct_cancel_revert(
         GCU_DIRECT_ON_CMD, "DGPU_DIRECT_CONNECT_TOGGLE_ON", "TOGGLE_ON",
         "保持独显直连", "可重跑 --direct on 撤回（其待重启分支会重发直连命令）")
+    if rc == 0:
+        runonce_clear_reconcile()  # 撤回成功：重启不会落省电，补账登记一并取消
+    return rc
 
 
 def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
@@ -2073,12 +2081,121 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
     return 1
 
 
+def _is_toggle_igpu_ledger(st: DisplayModeState) -> bool:
+    """账外省电态判定：直连账本挂着 TOGGLE_IGPU（直连直达落下的态）。
+
+    该态物理上是标准省电（PnP 断开 + DXGI 消失），但两本账与官方 UI 的
+    三态判定全对不上——控制台三态全灰（2026-11-20 真机实录）。
+    """
+    return "DGPU_DIRECT_CONNECT_TOGGLE_IGPU" in (st.gcu_direct_status or "").upper()
+
+
+def cmd_eco_reconcile() -> int:
+    """账外省电态补账：发 IGPU_RB_ON 把省电账本翻 ON，官方控制台恢复显示。
+
+    直连→省电直达（TOGGLE_IGPU）落下的态里省电账本没参与（记 RB_OFF），
+    官方 UI 因此失明。本命令在省电态下补发省电开关同款命令——独显已下线、
+    判据必过，EC 纯记账；补完直连账本 TOGGLE_IGPU + 省电账本 RB_ON，
+    官方 UI 三态恢复（省电亮）。幂等：不在省电态或账已对齐则直接退出。
+    （RunOnce 无人值守场景，输出走 _Tee 落 logs/eco_reconcile_*.txt）
+    """
+    st = read_display_mode_state()
+    enrich_with_gcu_status(st)
+    print("=== 省电账本对账（直连直达省电后的官方控制台识别补齐）===")
+    print_mode_state(st)
+    if st.base_mode != "igpu_only":
+        print("\n当前不在核显省电态，无账可补（可能已切换走），退出。")
+        return 0
+    if resolve_igpu_status(st.gcu_igpu_status) == 0:
+        print("\n✓ 省电账本已记 ON（对齐），官方控制台可正常识别，无需补账。")
+        return 0
+
+    info = probe_gcu()
+    if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+        print("\nX 本机不支持省电账本命令，无法补账（能力位/词表如上）。")
+        return 1
+
+    print("\n--- 发送补账命令（省电开关同款；独显已下线，判据必过）---")
+    for attempt in range(1, 3):
+        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
+                                          stop_keys=("IGpuOnlyConnectionSwitch_Status",
+                                                     "CheckDGpuStatusforIGpuOnlyOnSuccess"))
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}（RunOnce 场景请确认 GCUService 已启动）")
+            return 1
+        print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
+        print_gcu_events(events)
+        if not gcu_rejected(events):
+            break
+    print("\n--- 等待省电账本翻 ON（GETSTATUS 复查，5×1.8s）---")
+    ok, cur = wait_igpu_status("IGPU_ONLY_CONNECT_RB_ON")
+    if not ok:
+        print(f"X 省电账本未翻转（当前: {cur or '无回报'}）——官方控制台可能仍无法识别。")
+        print("  可稍后手动重跑 --eco reconcile，或 --status 查看当前账本。")
+        return 1
+    print(f"  ✓ 省电账本已翻 ON（{cur}）——官方控制台的核显省电恢复显示。")
+    return 0
+
+
+def _eco_off_from_toggle_igpu(st: DisplayModeState) -> int:
+    """账外省电态 → 混合（官方同款回程 TOGGLE_OFF）。
+
+    官方 UI 在账外态点「混合模式」发的就是 TOGGLE_OFF（MechrevoService.
+    CreateGpuSwitchPayload(1) 实录）——直连账本从 IGPU 位翻回 OFF 位；
+    省电开关通道（IGPU_RB_OFF）对这本没参与的账不保证有效。若此前补过账
+    （省电账本 RB_ON），翻回后补发 IGPU_RB_OFF 把它归位，UI 三态全正常。
+    TOGGLE 族属 MUX 命令，独显回线可能重启才兑现——如实验证、不猜。
+    """
+    info, rc = _direct_capability_gate("DGPU_DIRECT_CONNECT_TOGGLE_OFF")
+    if info is None:
+        return rc
+
+    print("\n--- 发送切换命令（TOGGLE_OFF，与控制中心点混合模式同路线）---")
+    status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+        return 1
+    print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
+    print_gcu_events(events)
+
+    print("\n--- 等待 GCU 确认（GETSTATUS 复查直连账本翻转，7×1.8s）---")
+    ok, cur = wait_direct_status("TOGGLE_OFF")
+    if not ok:
+        print(f"\nX GCU 未确认指令（当前直连账本: {cur or '无回报'}）。")
+        print("  仍在账外省电态；可重试 --hybrid，或 --status 查看当前账本。")
+        return 1
+    print(f"  ✓ GCU 已确认（直连账本 = {cur}）。")
+
+    # 补过账的（省电账本 RB_ON）：顺手归位，官方 UI 三态全清
+    if resolve_igpu_status(st.gcu_igpu_status) == 0:
+        print("\n--- 省电账本归位（此前补过账，补发 IGPU_RB_OFF）---")
+        status2, ev2 = gcu_mqtt_command(GCU_ECO_OFF_CMD, listen_secs=4.0,
+                                        stop_keys=IGPU_STATUS_KEYS)
+        if status2 == "ok":
+            print("  ✓ 归位命令已送达（IGPU_ONLY_CONNECT_RB_OFF）")
+        else:
+            print(f"  ! 归位命令发送失败（{status2}）——不影响回混合，账本可稍后对齐。")
+
+    print("\n--- 验证独显回线（PnP/DXGI，上限 60 秒；MUX 族命令可能重启才兑现）---")
+    res = wait_for_mode("hybrid", timeout_sec=60.0)
+    if res.mode == "hybrid":
+        print("\n✓ 已切回混合模式（独显在线，两本账归位）：")
+        print_mode_state(res)
+        return 0
+    print("\nX 60 秒内独显未回线——TOGGLE_OFF 可能需重启兑现。当前状态：")
+    print_mode_state(res)
+    print("处于待重启态：重启后落混合模式（--status 显示待重启态）。")
+    return 1
+
+
 def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
     """切回混合模式：确认省电态 → 发送 GCU 同款 MQTT 命令 → 凭证验证。
 
     不杀进程、不动 PnP，无需提权。
     """
     st = read_display_mode_state()
+    enrich_with_gcu_status(st)  # 账外态判定需要直连账本（GCU 意图回报）
     print("=== 显示模式切换：核显省电 → 混合模式 ===")
     print_mode_state(st)
     if st.mode == "hybrid":
@@ -2088,6 +2205,10 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         print(f"\n当前模式不是核显省电态（{MODE_LABELS.get(st.mode, st.mode)}），"
               "本命令只负责省电态 → 混合。")
         return 1
+    # 账外省电态（直连直达落下的）：官方同款 TOGGLE_OFF 回程，不走省电开关通道
+    if _is_toggle_igpu_ledger(st):
+        print("\n检测到账外省电态（直连直达落下，官方控制台三态不识别的态）。")
+        return _eco_off_from_toggle_igpu(st)
 
     # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）：行为不变，仅头部插入
     info = probe_gcu()
@@ -2147,6 +2268,61 @@ def wait_direct_status(token: str, rounds: int = 7,
             return True, cur
         print(f"  … 等待 GCU 确认（第 {i + 1}/{rounds} 轮，当前直连状态: {cur or '无回报'}）")
     return False, cur
+
+
+def wait_igpu_status(token: str, rounds: int = 5,
+                     round_secs: float = 1.8) -> tuple[bool, str]:
+    """GETSTATUS 复查省电账本字段翻转（与 wait_direct_status 同构，轮数减配）。"""
+    cur = ""
+    for i in range(rounds):
+        status, events = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=round_secs,
+                                          stop_keys=IGPU_STATUS_KEYS)
+        if status != "ok":
+            return False, f"GCU 控制通道不可用：{status}"
+        cur = str(first_field(merge_gcu_events(events), *IGPU_STATUS_KEYS) or "")
+        if token in cur.upper():
+            return True, cur
+        print(f"  … 等待账本翻转（第 {i + 1}/{rounds} 轮，当前省电账本: {cur or '无回报'}）")
+    return False, cur
+
+
+# --- RunOnce 补账登记（账外省电态对账，见 cmd_eco_reconcile） ---
+RUNONCE_KEY = (r"Software\Microsoft\Windows\CurrentVersion\RunOnce")
+RECONCILE_RUNONCE_NAME = "GpuModeSwitcherEcoReconcile"
+
+
+def _reconcile_command_line() -> str:
+    """RunOnce 里要执行的一条命令（exe 用自身；源码用 pythonw 静默跑脚本）。"""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --eco reconcile'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    runner = pyw if os.path.exists(pyw) else sys.executable
+    return f'"{runner}" "{os.path.abspath(__file__)}" --eco reconcile'
+
+
+def runonce_set_reconcile() -> bool:
+    """登记 RunOnce：重启登录后自动跑一次补账（Windows 执行后自删条目）。"""
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUNONCE_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, RECONCILE_RUNONCE_NAME, 0, winreg.REG_SZ,
+                              _reconcile_command_line())
+        return True
+    except OSError as e:
+        print(f"! RunOnce 登记失败（{e}）：重启后请手动跑 --eco reconcile 对账。")
+        return False
+
+
+def runonce_clear_reconcile() -> None:
+    """取消切换时清掉补账登记（重启后不再自动对账）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUNONCE_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, RECONCILE_RUNONCE_NAME)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"! RunOnce 清理失败（{e}）——重启后补账仍会自动跑一次，无妨（幂等）。")
 
 
 def restart_countdown(effect: str, seconds: int = 5) -> bool:
@@ -2436,11 +2612,13 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="非独显适配器（核显等）也一并报告")
     ap.add_argument("--json", action="store_true", help="JSON 输出（一次性快照）")
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
-    ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off"],
-                    metavar="{on,off}",
+    ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off", "reconcile"],
+                    metavar="{on,off,reconcile}",
                     help="核显省电切换编排（全程自动，GCU 控制通道与控制中心同路线）："
                          "on = 检测独显占用并清场后发官方同款命令开启核显省电并验证（默认）；"
-                         "off = 发命令切回混合模式并验证")
+                         "off = 发命令切回混合模式并验证；"
+                         "reconcile = 账外省电态补账（直连直达落下后对齐官方控制台识别，"
+                         "幂等，RunOnce 无人值守自动跑）")
     ap.add_argument("--direct", nargs="?", const="on", choices=["on", "off"],
                     metavar="{on,off}",
                     help="独显直连切换（MUX 切换，重启后生效）："
@@ -2519,6 +2697,17 @@ def main() -> int:
                     input("\n按回车关闭窗口…")
                 except EOFError:
                     pass
+
+    if args.eco == "reconcile":
+        log_path = eco_log_path("eco_reconcile")
+        log = _Tee(log_path)
+        sys.stdout = log  # 双写：终端（有则）+ 日志；RunOnce 无人值守靠日志留档
+        try:
+            print(f"（本次运行日志: {log_path}）")
+            return cmd_eco_reconcile()
+        finally:
+            sys.stdout = log._out
+            log.close()
 
     if args.eco == "off":
         return cmd_eco_off(adapters_meta)
