@@ -2,6 +2,7 @@ reference/
 .zcode/
 __pycache__/
 logs/
+settings.json
 # PyInstaller 打包产物
 build/
 dist/

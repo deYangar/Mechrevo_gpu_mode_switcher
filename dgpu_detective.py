@@ -1817,13 +1817,43 @@ class _Tee:
         self._f.close()
 
 
-def eco_log_path(prefix: str = "eco") -> str:
-    # onefile 冻结后 __file__ 指向临时解压目录（退出即焚），日志必须落在 exe 旁
-    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+def app_base_dir() -> str:
+    # onefile 冻结后 __file__ 指向临时解压目录（退出即焚），落盘文件
+    #（logs/、settings.json）必须放在 exe 旁
+    return os.path.dirname(sys.executable if getattr(sys, "frozen", False)
                            else os.path.abspath(__file__))
-    d = os.path.join(base, "logs")
+
+
+def eco_log_path(prefix: str = "eco") -> str:
+    d = os.path.join(app_base_dir(), "logs")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, time.strftime(f"{prefix}_%Y%m%d_%H%M%S.txt"))
+
+
+def cleanup_logs(retention_days: float) -> tuple[int, int]:
+    """按保留天数清理 logs/ 下超龄的切换留档（*.txt，按 mtime 判龄）。
+
+    返回 (删除数, 失败数)。单文件删除失败（被占用等 IO 边界）不中断，
+    计入失败数交调用方如实展示；目录不存在视作无事可做。
+    """
+    d = os.path.join(app_base_dir(), "logs")
+    deadline = time.time() - retention_days * 86400
+    removed = failed = 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0, 0
+    for name in names:
+        if not name.lower().endswith(".txt"):
+            continue
+        p = os.path.join(d, name)
+        try:
+            if os.path.getmtime(p) < deadline:
+                os.remove(p)
+                removed += 1
+        except OSError:
+            failed += 1
+    return removed, failed
 
 
 def proc_name(image: str) -> str:

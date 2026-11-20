@@ -122,6 +122,14 @@ def main() -> int:
     m = re.search(r" bar_h=(\d+)", lay)
     check("工具栏高度贴内容 bar_h<=80", bool(m) and int(m.group(1)) <= 80, lay)
 
+    # 12) 日志保留下拉：渲染出宽度（>0）且选中值在五档内
+    #（不假设默认档——settings.json 可能记着用户上次的档位）
+    ret = next((l for l in lines if l.startswith("retention:")), "")
+    m = re.search(r"retention: '(.*?)' w=(\d+)", ret)
+    check("日志保留下拉渲染+合法档", bool(m) and m.group(1) in
+          ("不开启", "保留 3 天", "保留 7 天", "保留 30 天", "不自动清理")
+          and int(m.group(2)) > 0, ret)
+
     n_ok = sum(results)
     print(f"--- {n_ok}/{len(results)} PASS ---")
     return 0 if n_ok == len(results) else 1

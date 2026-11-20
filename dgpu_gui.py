@@ -6,8 +6,8 @@
 - 「独显直连 / 混合模式 / 核显省电」（按性能排）= 内嵌控制台原样运行
   cmd_direct_on / cmd_hybrid / cmd_eco_on（cmd_hybrid 按当前态自动路由
   cmd_eco_off / cmd_direct_off）：
-  print 重定向进日志面板（双写 logs/eco_*.txt、logs/hybrid_*.txt、
-  logs/direct_*.txt 留档），
+  print 重定向进日志面板（按「日志保留」下拉策略双写 logs/eco_*.txt、
+  logs/hybrid_*.txt、logs/direct_*.txt 留档，超龄自动清理），
   ask() 的 input() 弹问答框应答（重启三选默认安全侧），
   编排代码零改动——CLI 双向真测过的路径就是 GUI 跑的路径
 - 驱动层持有者（NVAPI/NVML 口径，补 WDDM 盲区）合并进主表格：后台线程自动扫，
@@ -66,6 +66,43 @@ _patch_ctk_button_hitbox()
 
 # 模式名（日志反馈用）：与按钮文案一致
 MODE_NAMES = {"direct_on": "独显直连", "hybrid": "混合模式", "on": "核显省电"}
+
+# 日志保留档位（顺序即下拉顺序）：key 存 settings.json，days 三态——
+# None=不写留档文件；-1=写但永不清理；>0=保留天数（超龄自动清理）
+LOG_RETENTION = [
+    ("off",     "不开启",     None),
+    ("3d",      "保留 3 天",  3),
+    ("7d",      "保留 7 天",  7),
+    ("30d",     "保留 30 天", 30),
+    ("forever", "不自动清理", -1),
+]
+LOG_RETENTION_DEFAULT = "30d"
+LOG_RETENTION_DAYS = {k: d for k, _l, d in LOG_RETENTION}
+LOG_RETENTION_LABEL = {k: l for k, l, _d in LOG_RETENTION}
+
+
+def _settings_path() -> str:
+    return os.path.join(eng.app_base_dir(), "settings.json")
+
+
+def _load_log_retention() -> str:
+    """读 settings.json 的日志保留档位；缺失/损坏/非法值回落默认档。"""
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            v = json.load(f).get("log_retention")
+        if v in LOG_RETENTION_DAYS:
+            return v
+    except (OSError, ValueError, AttributeError):
+        pass
+    return LOG_RETENTION_DEFAULT
+
+
+def _save_log_retention(key: str):
+    """原子写（tmp + 替换）防半截文件；IO 异常交调用方如实展示。"""
+    tmp = _settings_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"log_retention": key}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _settings_path())
 
 
 def co_init() -> None:
@@ -261,6 +298,8 @@ class App:
 
         self.ask_bridge = _AskBridge(self.q)
 
+        self.log_retention = _load_log_retention()  # 日志保留档位（settings.json）
+
         # 表格状态
         self.chips = {}        # luid_str -> (mem_label, eng_label)
         self.rowmeta = {}      # iid -> row dict
@@ -269,6 +308,7 @@ class App:
         self._table_sig = None  # 上次渲染的数据签名（无变化跳过重建，防拖动/空闲闪烁）
 
         self._build_ui()
+        self._cleanup_aged_logs(LOG_RETENTION_DAYS[self.log_retention])
 
         self.sampler = threading.Thread(target=self._sampler_loop, daemon=True)
         self.sampler.start()
@@ -521,10 +561,17 @@ class App:
                            command=self._clear_log).pack(side="left")
         self._ghost_button(topbar, "打开日志目录", width=110,
                            command=self._open_log_dir).pack(side="left", padx=6)
-        ctk.CTkLabel(topbar, text="切换按钮在上方运行完整切换编排，"
-                                  "输出同步留档 logs/（eco_/hybrid_/direct_）",
+        ctk.CTkLabel(topbar, text="切换输出留档 logs/",
                      text_color=MUTED, font=(FONT_FAMILY, 12)).pack(
             side="left", padx=6)
+        # 日志保留策略：改档即存 settings.json 并立即按新档清一轮超龄留档
+        self.retention_menu = ctk.CTkOptionMenu(
+            topbar, values=[l for _k, l, _d in LOG_RETENTION],
+            width=110, height=28, font=(FONT_FAMILY, 12),
+            dropdown_font=(FONT_FAMILY, 12),
+            command=self._on_log_retention)
+        self.retention_menu.set(LOG_RETENTION_LABEL[self.log_retention])
+        self.retention_menu.pack(side="left")
 
         body = ctk.CTkFrame(holder, fg_color=BG)
         body.pack(side="top", fill="both", expand=True, padx=4, pady=4)
@@ -1067,13 +1114,17 @@ class App:
 
     def _switch_worker(self, target: str):
         co_init()
-        try:
-            logf = open(eng.eco_log_path({"on": "eco", "hybrid": "hybrid",
-                                          "direct_on": "direct"}[target]),
-                        "w", encoding="utf-8", errors="replace", buffering=1)
-        except OSError as e:
-            self.log_q.put(f"（日志文件创建失败，仅面板显示：{e}）\n")
-            logf = None
+        # 档位快照（切换中途改档不影响本次编排）：off 档不写留档文件
+        prefix = {"on": "eco", "hybrid": "hybrid", "direct_on": "direct"}[target]
+        retention_days = LOG_RETENTION_DAYS[self.log_retention]
+        logf = None
+        if retention_days is not None:
+            try:
+                logf = open(eng.eco_log_path(prefix),
+                            "w", encoding="utf-8", errors="replace",
+                            buffering=1)
+            except OSError as e:
+                self.log_q.put(f"（日志文件创建失败，仅面板显示：{e}）\n")
         sink = _LogSink(self.log_q, logf)
         self._sink = sink
         titles = {
@@ -1103,6 +1154,8 @@ class App:
         finally:
             if logf:
                 logf.close()
+            # 留档档顺带清一轮超龄文件（本次新文件 mtime 必新，不会自删）
+            self._cleanup_aged_logs(retention_days)
             self._sink = None
             self.q.put(("ecodone", target, rc))
 
@@ -1253,6 +1306,10 @@ class App:
         lines.append("buttons: " + ",".join(
             f"{str(b.cget('text'))}={b.cget('state')}" for b in self._switch_buttons()))
         lines.append(f"badge: {self.mode_badge.cget('text')!r} evidence: {self.evidence.cget('text')!r}")
+        # 日志保留下拉：选中档（不假设默认——settings.json 可能记了别的档）
+        # + 实际渲染宽度（>0 才算没被布局挤没）
+        lines.append(f"retention: {self.retention_menu.get()!r} "
+                     f"w={self.retention_menu.winfo_width()}")
         # 状态栏几何：验证两行布局（evidence 须在徽章下一行且占全宽；
         # 单行回退时两者 y 相等）
         lines.append(f"statusbar: badge_y={self.mode_badge.winfo_y()} "
@@ -1300,6 +1357,29 @@ class App:
 
     def _open_log_dir(self):
         os.startfile(os.path.dirname(eng.eco_log_path()))  # 顺带建目录
+
+    def _on_log_retention(self, label: str):
+        """下拉改档：更新档位 → 存盘（失败如实报，仅本次会话生效）→
+        立即按新档清一轮（切换到 off 档不动旧文件，用户自管）。"""
+        self.log_retention = next(k for k, l, _d in LOG_RETENTION
+                                  if l == label)
+        try:
+            _save_log_retention(self.log_retention)
+        except OSError as e:
+            self.log_q.put(f"（日志保留设置保存失败，仅本次会话生效：{e}）\n")
+        self._cleanup_aged_logs(LOG_RETENTION_DAYS[self.log_retention])
+
+    def _cleanup_aged_logs(self, days):
+        """days 三态：None=off 档不清理；-1=forever 档不清；>0=按天清理。
+        在启动、改档、每次切换留档后调用；有删除/失败才落面板反馈。"""
+        if days is None or days < 0:
+            return
+        removed, failed = eng.cleanup_logs(days)
+        if removed or failed:
+            msg = f"（日志清理：删除 {removed} 个超龄留档"
+            if failed:
+                msg += f"，{failed} 个删除失败（可能被占用）"
+            self.log_q.put(msg + "）\n")
 
     # ------------------------------------------------------------- 退出
 
