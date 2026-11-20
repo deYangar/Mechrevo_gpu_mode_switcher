@@ -5,7 +5,7 @@ r"""exe 冒烟测试（提权运行）：launch → 找窗口 → 屏幕外断�
 被测 exe 带 uac-admin 清单，本脚本也必须提权跑，否则 UIPI 挡 PrintWindow/PostMessage。
 
 用法（外部用 Start-Process -Verb RunAs 提权启动，pythonw 无控制台）：
-  pythonw tools\exe_smoke.py           # 测 dist\dgpu_detective.exe
+  pythonw tools\exe_smoke.py           # 测 dist\gpu_mode_switcher.exe
 结果写 test_artifacts\exe_smoke_result.txt，退出码 0=全过。
 """
 
@@ -27,8 +27,8 @@ for _name in ("stdout", "stderr"):
         setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(PROJ, "dist", "dgpu_detective.exe")
-TITLE = "独显占用侦探"
+EXE = os.path.join(PROJ, "dist", "gpu_mode_switcher.exe")
+TITLE = "机革显卡模式切换妙妙小工具"
 ART = os.path.join(PROJ, "test_artifacts")
 
 user32 = ctypes.windll.user32

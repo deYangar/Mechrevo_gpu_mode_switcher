@@ -14,12 +14,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('080404b0', [
         StringStruct('CompanyName', ''),
-        StringStruct('FileDescription', '独显占用侦探'),
+        StringStruct('FileDescription', '机革显卡模式切换妙妙小工具'),
         StringStruct('FileVersion', '1.0.0.0'),
-        StringStruct('InternalName', 'dgpu_detective'),
+        StringStruct('InternalName', 'gpu_mode_switcher'),
         StringStruct('LegalCopyright', ''),
-        StringStruct('OriginalFilename', 'dgpu_detective.exe'),
-        StringStruct('ProductName', '独显占用侦探'),
+        StringStruct('OriginalFilename', 'gpu_mode_switcher.exe'),
+        StringStruct('ProductName', '机革显卡模式切换妙妙小工具'),
         StringStruct('ProductVersion', '1.0.0.0')
       ])
     ]),

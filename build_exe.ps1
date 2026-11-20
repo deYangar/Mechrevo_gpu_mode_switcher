@@ -1,4 +1,4 @@
-# 独显占用侦探一键打包：dist\dgpu_detective.exe（onefile + windowed + uac_admin）
+# 机革显卡模式切换妙妙小工具一键打包：dist\gpu_mode_switcher.exe（onefile + windowed + uac_admin）
 # 用法：pwsh -NoProfile -File build_exe.ps1
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
@@ -21,5 +21,5 @@ if ($LASTEXITCODE -ne 0) {
 python -m PyInstaller --noconfirm --clean --log-level WARN dgpu_detective.spec
 if ($LASTEXITCODE -ne 0) { throw "打包失败" }
 
-$out = Get-Item dist\dgpu_detective.exe
-Write-Host ("构建完成: dist\dgpu_detective.exe  {0:N1} MB" -f ($out.Length / 1MB))
+$out = Get-Item dist\gpu_mode_switcher.exe
+Write-Host ("构建完成: dist\gpu_mode_switcher.exe  {0:N1} MB" -f ($out.Length / 1MB))

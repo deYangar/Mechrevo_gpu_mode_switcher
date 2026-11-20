@@ -1,4 +1,4 @@
-"""独显占用侦探 —— 图形界面版（单文件，复用 dgpu_detective 引擎，界面层 CustomTkinter 深色主题）。
+"""机革显卡模式切换妙妙小工具 —— 图形界面版（单文件，复用 dgpu_detective 引擎，界面层 CustomTkinter 深色主题）。
 
 - 持有者表格 = --report/--watch 的常驻版：自动刷新，新持有黄底高亮
 - 显示模式徽章 = --status 四态凭证（内屏路由 / PnP problem / DXGI / GCU 意图回报），
@@ -229,7 +229,7 @@ class App:
 
     def __init__(self, root: ctk.CTk, adapters: list):
         self.root = root
-        root.title("独显占用侦探")
+        root.title("机革显卡模式切换妙妙小工具")
         # 三切换按钮（核显省电/混合模式/独显直连）在工具栏单行可见；
         # 曾是四按钮时代定的 1180（1040 下末键被裁，2026-11-17 exe 截图实测），
         # 2026-11-17 两回混合按钮合一后沿用，余量让给表格列
@@ -939,7 +939,7 @@ class App:
         if is_protected(m["image"]):
             name = m["image"] if m["image"].startswith("<") else m["image"].rsplit("\\", 1)[-1]
             messagebox.showwarning(
-                "独显占用侦探",
+                "机革显卡模式切换妙妙小工具",
                 f"{name} 在系统/服务组件保护名单里（杀了被拉回或影响系统），"
                 "与命令行口径一致：不杀。")
             return
@@ -950,7 +950,7 @@ class App:
         ok, msg = taskkill_pid(m["pid"]) if by_pid else eng.kill_by_name(name)
         line = f"[杀进程] {'✓' if ok else '✗'} {target}" + ("" if ok else f" —— {msg[:200]}")
         self.log_q.put(line + "\n")
-        (messagebox.showinfo if ok else messagebox.showerror)("独显占用侦探", line)
+        (messagebox.showinfo if ok else messagebox.showerror)("机革显卡模式切换妙妙小工具", line)
         if ok:
             self._manual_req = True  # 立即复查一眼
 
@@ -996,7 +996,7 @@ class App:
 
     def _export_json(self):
         if not self.last_data:
-            messagebox.showinfo("独显占用侦探", "还没有采样数据，稍等片刻再导出。")
+            messagebox.showinfo("机革显卡模式切换妙妙小工具", "还没有采样数据，稍等片刻再导出。")
             return
         fn = filedialog.asksaveasfilename(
             defaultextension=".json",
@@ -1028,7 +1028,7 @@ class App:
             return
         if target == "on" and not eng.is_admin():
             messagebox.showwarning(
-                "独显占用侦探",
+                "机革显卡模式切换妙妙小工具",
                 "未以管理员运行：清场要杀以管理员运行的软件（HWiNFO 等），切不动。\n"
                 "exe 版自带 UAC 提权；源码运行请用管理员终端启动。")
             return
@@ -1304,7 +1304,7 @@ class App:
     def _on_close(self):
         if self.switch_running:
             if not messagebox.askyesno(
-                    "独显占用侦探",
+                    "机革显卡模式切换妙妙小工具",
                     "切换编排正在进行（详见切换日志），现在退出可能停在"
                     "「清了场没切完」的中间态。\n确定退出吗？"):
                 return
@@ -1369,7 +1369,7 @@ def main() -> int:
         adapters = eng.enumerate_adapters()
     except OSError as e:
         root.withdraw()
-        messagebox.showerror("独显占用侦探", f"DXGI 枚举失败: {e}")
+        messagebox.showerror("机革显卡模式切换妙妙小工具", f"DXGI 枚举失败: {e}")
         return 1
     app = App(root, adapters)
     root.protocol("WM_DELETE_WINDOW", app._on_close)

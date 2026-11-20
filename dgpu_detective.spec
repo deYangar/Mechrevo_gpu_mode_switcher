@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 独显占用侦探单文件打包：dgpu_detective.exe（onefile + windowed + uac_admin）
+# 机革显卡模式切换妙妙小工具单文件打包：gpu_mode_switcher.exe（onefile + windowed + uac_admin）
 # 双击即 UAC 提权运行，界面为 dgpu_gui.py（CustomTkinter 深色）；构建入口：pwsh -NoProfile -File build_exe.ps1
 
 from pathlib import Path
@@ -43,7 +43,7 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,   # 全部内嵌 = onefile 单文件
-    name='dgpu_detective',
+    name='gpu_mode_switcher',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
