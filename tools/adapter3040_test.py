@@ -5,6 +5,9 @@ R4：Gen40 判档三态化——raw/reg 双空 → three_mode=None + TRI 词表 
     附带凭据前缀分线（E1/E2）：公式、注册表分线、无线索兜底。
 R5：eco lite 路由——gen30+igpu_only=False 改走 cmd_eco_lite；
     词表无 lite 时原拒绝分支保留；3e pnp_disabled 语义三分支。
+R6：Gen40 能力位误报修正——Support=0 而状态字段活跃回报 → 实证置 True
+    （2026-11-20 40 系三模真机：eco 按钮被误禁零反应零日志）；
+    无状态字段时 False 维持（双模机 lite 路由依据不变）。
 
 用法：python tools/adapter3040_test.py；全过退出码 0。
 """
@@ -257,6 +260,51 @@ def main() -> int:
     check("R5-5 50系在线不误判lite", rc == 1
           and "PnP 软禁用残留" in out and "已在 lite" not in out,
           f"rc={rc}")
+
+    # ---------------- R6：Gen40 能力位误报修正（状态字段实证 > Support 位） ----------------
+    # R6-1 40 系三模真机实锤（2026-11-20 反馈）：Support=0 而 IGPU 状态字段活跃
+    #     回报 → 实证置 True（eco 按钮不再被误禁）；词表仍按判档走 TRI 全集
+    r = _probe_env("gen40",
+                   raw_events=[("Setting/Status", json.dumps({
+                       "IGpuOnlyConnectionSwitch_Support": "0",
+                       "IGpuOnlyConnectionSwitch_Status": "IGPU_ONLY_CONNECT_RB_OFF"}))],
+                   reg={})
+    try:
+        info = eng.probe_gcu()
+        out, _ = _capture(eng.print_gcu_info, info)
+    finally:
+        r()
+    check("R6-1 Support=0+状态字段在场→True",
+          info.igpu_only is True and "状态字段实证" in info.igpu_source
+          and info.vocab == set(eng.GEN40_TRI_ACTIONS),
+          f"igpu_only={info.igpu_only} 来源={info.igpu_source}")
+
+    # R6-2 真双模机不受影响：Support=0 且无状态字段 → False 维持（lite 路由依据不变）
+    r = _probe_env("gen40",
+                   raw_events=[("Setting/Status", json.dumps({
+                       "IGpuOnlyConnectionSwitch_Support": "0"}))],
+                   reg={})
+    try:
+        info = eng.probe_gcu()
+    finally:
+        r()
+    check("R6-2 Support=0+无状态字段→False维持",
+          info.igpu_only is False, f"igpu_only={info.igpu_only}")
+
+    # R6-3 直连对称：Direct Support=0 而直连状态字段在场 → dgpu_direct=True
+    r = _probe_env("gen40",
+                   raw_events=[("Setting/Status", json.dumps({
+                       "DGpuDirectConnectionSwitch_Support": "0",
+                       "DiscreteGpuDirectConnectionSwitch_Status":
+                           "DGPU_DIRECT_CONNECT_TOGGLE_OFF"}))],
+                   reg={})
+    try:
+        info = eng.probe_gcu()
+    finally:
+        r()
+    check("R6-3 直连对称→True",
+          info.dgpu_direct is True and "状态字段实证" in info.dgpu_source,
+          f"dgpu_direct={info.dgpu_direct} 来源={info.dgpu_source}")
 
     print(f"\n{'=' * 40}\n{'全部通过' if all(results) else '存在失败'}："
           f"{sum(results)}/{len(results)}")

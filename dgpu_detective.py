@@ -1442,13 +1442,21 @@ def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
     igpu_only = first_optional_bool(
         raw, "IGpuOnlyConnectionSwitch_Support",
         "IGPUOnlyConnectionSwitch_Support", "IGPU_ONLY_SUPPORT") if raw else None
-    # 隐式能力：状态字段出现且被识别 → 能力位补 True（IsRecognized* 实录）
-    if dgpu_direct is None and resolve_direct_status(direct_status) is not None:
+    # 状态字段实证 > Support 位（IsRecognized* 实录提级）：GCU 活跃回报某功能的
+    # 状态字段 = 功能存在的直接证据，Support 位 False 不再否决——Gen40 能力位
+    # 误报实录（E8 注册表位不可靠；2026-11-20 40 系三模真机反馈：在线
+    # Support=0 而 IGPU 状态字段活跃回报，eco 按钮被误禁、点击零反应零日志）。
+    # 双模机不受影响：无该功能的 GCU 不回报对应状态字段，Support=False 维持。
+    dgpu_by_status = resolve_direct_status(direct_status) is not None
+    igpu_by_status = resolve_igpu_status(igpu_status) is not None
+    if dgpu_by_status:
         dgpu_direct = True
-    if igpu_only is None and resolve_igpu_status(igpu_status) is not None:
+    if igpu_by_status:
         igpu_only = True
-    dgpu_source = "在线回报" if dgpu_direct is not None else ""
-    igpu_source = "在线回报" if igpu_only is not None else ""
+    dgpu_source = ("在线回报（状态字段实证）" if dgpu_by_status
+                   else "在线回报" if dgpu_direct is not None else "")
+    igpu_source = ("在线回报（状态字段实证）" if igpu_by_status
+                   else "在线回报" if igpu_only is not None else "")
 
     # 回落：注册表能力位（三根双视图别名族）
     reg = read_gcu_registry_caps()
