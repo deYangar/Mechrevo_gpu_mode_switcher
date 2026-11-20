@@ -1014,7 +1014,7 @@ class App:
         """target: direct_on（独显直连）/ hybrid（回混合，按态自动路由）/ on（核显省电）。
 
         hybrid/direct 方向不杀进程不动 PnP（省电态串联的 cmd_eco_off 同样无需提权），
-        所以只有 eco on 要求管理员——与 CLI 口径一致。
+        eco on 仅混合态清场路径要求管理员（直连态 MUX 重启编排不清场）——与 CLI 口径一致。
         """
         if self.switch_running:
             return
@@ -1026,7 +1026,8 @@ class App:
         if target == already:
             self.log_q.put(f"[模式] 当前已是{MODE_NAMES[target]}，无需切换。\n")
             return
-        if target == "on" and not eng.is_admin():
+        if target == "on" and mode not in ("dgpu_direct", "direct_pending") \
+                and not eng.is_admin():
             messagebox.showwarning(
                 "机革显卡模式切换妙妙小工具",
                 "未以管理员运行：清场要杀以管理员运行的软件（HWiNFO 等），切不动。\n"
@@ -1078,7 +1079,7 @@ class App:
         titles = {
             "direct_on": "独显直连切换（探测 → 发令 → GCU 确认 → 重启三选）",
             "hybrid": "回混合模式（按当前态自动路由：省电→MQTT 回线 / 直连→MUX 重启三选）",
-            "on": "核显省电切换（检测 → 清场 → 官方同款命令 → 凭证验证）",
+            "on": "核显省电切换（混合态：清场+官方同款命令 / 直连态：MUX 重启直达）",
         }
         sink.write(f"\n===== {titles.get(target, target)} "
                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")

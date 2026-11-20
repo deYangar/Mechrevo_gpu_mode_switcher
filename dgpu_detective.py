@@ -912,6 +912,9 @@ GCU_ECO_OFF_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_OFF", "SetToWMIEC": "OK"}'
 # 直连命令（方案 §2.4 V1 定案）：纯 Action 报文，不带 SetToWMIEC
 GCU_DIRECT_ON_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_ON"}'
 GCU_DIRECT_OFF_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_OFF"}'
+# 直连态切核显省电的主命令（MechrevoService.CreateGpuSwitchPayload 实录）：
+# 三模档 mode 0 不走 IGPU_ONLY 族（那是混合态省电开关专用），MUX 直达核显独占
+GCU_DIRECT_IGPU_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_IGPU"}'
 GCU_DIRECT_RESTART_CMD = '{"Action": "DGPU_DIRECT_CONNECT_RESTART"}'
 GCU_GETSTATUS_CMD = '{"Action": "GETSTATUS"}'
 
@@ -1772,10 +1775,80 @@ def print_eco_rows(rows: list[dict], title: str) -> None:
               f"  VRAM {r['local_mb']:>8.2f} MB  {eng}{note}")
 
 
+def _eco_on_from_direct(st: DisplayModeState) -> int:
+    """直连态/直连待重启态 → 核显省电（官方 SwitchGpuMode(mode=0) 三模档实录）。
+
+    核显省电的前提是内屏由核显驱动；直连态内屏挂在独显上，必须先过 MUX
+    （重启生效）。官方主命令是 DGPU_DIRECT_CONNECT_TOGGLE_IGPU——MUX 直达
+    核显独占，重启后即省电态，全程不发 IGPU_ONLY 族（那是混合态省电开关
+    专用通道，直连态发它判据永不可能满足）。2026-11-20 修正：此前无此分支，
+    直连态误走混合态清场+发令路径，切换必然失败。
+    不清场（内屏在独显上，杀持有者无意义）、无需提权。
+    """
+    enrich_with_gcu_status(st)  # 待重启态分流需要意图（mode property 动态重判）
+    if st.mode == "direct_pending":
+        # 进得来此函数的实况必是直连，pending 只能是「退出直连」方向（意图核显/混合）
+        if st.gcu_intent == 0:
+            print("\n「直连 → 核显省电」指令已生效待重启：重启后即到核显省电态"
+                  "（--status / GUI 徽章显示待重启态）。")
+            return 0
+        print("\n检测到「直连回混合」待重启指令：重启后落混合模式，"
+              "再跑 --eco 完成省电（混合态路径无需重启）。")
+        return 0
+
+    print("\n当前为独显直连态：核显省电须先退出直连（MUX 切换，重启生效）——"
+          "与控制中心同款走 TOGGLE_IGPU，一次重启直达省电态。")
+    info, rc = _direct_capability_gate("DGPU_DIRECT_CONNECT_TOGGLE_IGPU")
+    if info is None:
+        return rc
+
+    print("\n--- 发送切换命令（GCU 控制通道，纯 Action 报文与控制中心同路线）---")
+    status, events = gcu_mqtt_command(GCU_DIRECT_IGPU_CMD, listen_secs=2.0)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+        return 1
+    print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_IGPU）")
+    print_gcu_events(events)
+
+    print("\n--- 等待 GCU 确认（GETSTATUS 复查直连状态翻转，7×1.8s）---")
+    ok, cur = wait_direct_status("TOGGLE_IGPU")
+    if not ok:
+        print(f"\nX GCU 未确认指令（当前直连状态: {cur or '无回报'}）。")
+        res = read_display_mode_state()
+        enrich_with_gcu_status(res)
+        print_mode_state(res)
+        print("建议：重启是 MUX pending 卡住的实测恢复手段（L-Mechrevo 同款实录）。")
+        return 1
+    print(f"  ✓ GCU 已确认（直连状态 = {cur}）——处于待重启态，"
+          "重启后内屏改由核显驱动、独显断电。")
+
+    choice = direct_restart_choice()
+    if choice == "1":
+        if not restart_countdown("仍会切换为核显省电"):
+            return 0  # 倒计时取消：命令已发，如实停在待重启态
+        print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
+        rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
+        if rst != "ok":
+            print(f"X 重启命令发送失败：{rst}")
+            print("  机器未重启；已处于待重启态，可稍后手动重启或重跑 --eco。")
+            return 1
+        print("  ✓ 重启命令已发出，机器即将重启。")
+        return 0
+    if choice == "2":
+        print("  保持待重启态：稍后自行重启即完成切换（--status 显示待重启态）。")
+        return 0
+    # 取消撤回：发 TOGGLE_ON 翻回直连意图（IGPU 意图从没发过，无需撤）
+    return _direct_cancel_revert(
+        GCU_DIRECT_ON_CMD, "DGPU_DIRECT_CONNECT_TOGGLE_ON", "TOGGLE_ON",
+        "保持独显直连", "可重跑 --direct on 撤回（其待重启分支会重发直连命令）")
+
+
 def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
                auto_yes: bool = False, keep_names: set[str] | None = None) -> int:
     """切核显省电（真切换）：检测独显持有 → 清场 → 发 GCU 同款 MQTT 命令 → 凭证验证。
 
+    直连/直连待重启态走 _eco_on_from_direct（MUX 重启直达，官方三模档实录）。
     auto_yes：清场确认自动应答 1（无人值守跑法；GUI 不传，走问答框）。
     keep_names：清场豁免名单（小写进程名）；其余候选照杀、豁免者保留在场——
     受控实验用（如只留 steam.exe/Everything.exe，实测它们是否挡 GCU 判据）。
@@ -1794,6 +1867,17 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
     if st.mode == "unknown":
         print("\n无法判定当前显示模式（PnP/DXGI 凭证异常，如上），不继续。")
         return 1
+    # 直连/直连待重启态走 MUX 重启直达编排（官方 SwitchGpuMode(mode=0) 实录），
+    # 不走下面的清场+IGPU 命令——那是混合态专用路径
+    if st.mode in ("dgpu_direct", "direct_pending"):
+        return _eco_on_from_direct(st)
+    if st.mode == "hybrid":
+        # 混合实况下可能挂着「进入直连」待重启指令——此刻切省电重启后会落直连白切
+        enrich_with_gcu_status(st)
+        if st.mode == "direct_pending":
+            print("\n检测到「进入直连」待重启指令（与目标相反）：先重启落直连后重跑 --eco，")
+            print("  或 --direct on 撤回回混合后再切省电。")
+            return 1
 
     # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）：行为不变，仅头部插入
     # ——30 系等无 IGPU_ONLY_* 词表的机型在这里如实退出，不再空试
