@@ -2460,10 +2460,10 @@ def _eco_off_from_toggle_igpu(st: DisplayModeState) -> int:
         print("\n✓ 已切回混合模式（独显在线，两本账归位）：")
         print_mode_state(res)
         return 0
-    print("\nX 60 秒内独显未回线——TOGGLE_OFF 可能需重启兑现。当前状态：")
+    print("\n! 60 秒内独显未回线——TOGGLE_OFF 已获 GCU 确认，回线需重启兑现"
+          "（Gen40 无热切换词汇机型常态，非失败）。当前状态：")
     print_mode_state(res)
-    print("处于待重启态：重启后落混合模式（--status 显示待重启态）。")
-    return 1
+    return eco_restore_restart_choice()
 
 
 def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
@@ -2514,12 +2514,24 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
         print("\n✓ 已切回混合模式（独显重新在线）：")
         print_mode_state(res)
         return 0
-    print("\nX 100 秒内独显未重新上线。当前状态：")
+    print("\n! 100 秒内独显未重新上线。当前状态：")
     print_mode_state(res)
-    st2, ev2 = gcu_mqtt_command('{"Action": "GETSTATUS"}', listen_secs=4.0)
+    # 分流凭据：省电账本已翻 OFF = 命令已交接、回线重启兑现（Gen40 无热切换
+    # 词汇机型常态）→ 待重启二选；账本仍 ON = GCU 没接账，才是真失败
+    st2, ev2 = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=4.0)
+    ledger: int | None = None
     if st2 == "ok":
         print_gcu_events(ev2)
-    print("可稍后重试，或用 --status 随时查看当前模式。")
+        ledger = resolve_igpu_status(
+            str(first_field(merge_gcu_events(ev2), *IGPU_STATUS_KEYS) or ""))
+    if ledger == 1:
+        return eco_restore_restart_choice()
+    if ledger == 0:
+        print("X 省电账本仍为 ON——GCU 未接受切换指令，这是真失败非待重启。")
+        print("  可稍后重试，或用 --status 随时查看当前模式。")
+        return 1
+    print("X 省电账本无回报，无法判定指令是否被接受（如实按失败处理）。")
+    print("  可稍后重试，或用 --status 随时查看当前模式。")
     return 1
 
 
@@ -2737,6 +2749,121 @@ def _direct_cancel_revert(revert_cmd: str, action_name: str, token: str,
     return 0
 
 
+def eco_restore_restart_choice() -> int:
+    """省电→混合落入待重启态的重启二选（归位令已获 GCU 确认、独显回线重启兑现）。
+
+    2026-11-20 40 系三模真机 log 定案：Gen40 无热切换词汇，回线重启才兑现
+    ——这不是失败，是已交接的待重启态（官方 SwitchGpuMode 同款口径）。
+    不设「取消」：不重启即留在省电现状，本身就是安全侧；把账本翻回 RB_ON
+    与「留在现状」等价，不做不动状态的语言艺术取消。
+    """
+    print("处于待重启态：重启后落混合模式（--status 显示待重启态）。")
+    choice = ask("[1] 立即重启（5 秒可取消倒计时后由 GCU 执行重启）"
+                 "  [2] 稍后自行重启（保持待重启态）"
+                 "  [回车/其他] 同 [2]")
+    if choice == "1":
+        if not restart_countdown("重启后落混合模式"):
+            return 0
+        print("\n--- 发送重启命令（GCU 收到后自行执行 shutdown /r /t 0）---")
+        rst, _ev = gcu_mqtt_command(GCU_DIRECT_RESTART_CMD, listen_secs=2.0)
+        if rst != "ok":
+            print(f"X 重启命令发送失败：{rst}")
+            print("  机器未重启；已处于待重启态，可稍后手动重启或重跑 --hybrid。")
+            return 1
+        print("  ✓ 重启命令已发出，机器即将重启。")
+        return 0
+    print("  保持待重启态：稍后自行重启即落混合模式（--status 显示待重启态）。")
+    return 0
+
+
+def _direct_eco_ledger_preflight(st: DisplayModeState) -> int:
+    """省电态 → 直连的账本归位前置（对齐官方 SwitchGpuMode(0→2) 思路）。
+
+    官方省电→直连主命令直接 TOGGLE_ON、确认预算不足 1 秒、直奔重启——没有
+    「先回混合」中间站。旧编排死等独显热回线（30/50 系热切通），40 系无热切
+    换词汇永远等不到，把重启三选卡死在半路（2026-11-20 真机 log 定案）。
+
+    账外省电态（直连账本挂 TOGGLE_IGPU）：先 TOGGLE_OFF 翻回混合位（硬门槛，
+    GCU 接受该翻转有真机实录；翻不动就不该继续）。随后一律补发 RB_OFF 归位
+    省电账本（软门槛：GCU 不回报该字段的机型仅告警——直连主令的账本确认
+    才是关键凭证）。归位后回 cmd_direct_on 发 TOGGLE_ON → 重启三选，
+    一次重启直达直连。
+    """
+    if _is_toggle_igpu_ledger(st):
+        print("\n当前为账外省电态（直连账本挂 TOGGLE_IGPU）——"
+              "先归位直连账本，再发直连主令（一次重启直达直连）。")
+        print("\n--- 归位直连账本（TOGGLE_OFF，与控制中心点混合模式同路线）---")
+        status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}")
+            print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+            return 1
+        print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
+        print_gcu_events(events)
+        print("\n--- 等待 GCU 确认（GETSTATUS 复查直连账本翻转，7×1.8s）---")
+        ok, cur = wait_direct_status("TOGGLE_OFF")
+        if not ok:
+            print(f"\nX GCU 未确认归位（当前直连账本: {cur or '无回报'}）。")
+            print("  仍在账外省电态；可稍后重试，或 --status 查看当前账本。")
+            return 1
+        print(f"  ✓ GCU 已确认（直连账本 = {cur}）。")
+    else:
+        print("\n当前为核显省电态——归位省电账本后直接发直连主令"
+              "（一次重启直达直连，不再等独显热回线：Gen40 无热切换词汇机型"
+              "回线本就重启才兑现，官方 0→2 亦无「先回混合」中间站）。")
+    print("\n--- 归位省电账本（IGPU_RB_OFF，重启后官方三态识别干净）---")
+    status, ev = gcu_mqtt_command(GCU_ECO_OFF_CMD, listen_secs=8.0,
+                                  stop_keys=IGPU_STATUS_KEYS)
+    if status != "ok":
+        print(f"X GCU 控制通道不可用：{status}")
+        print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+        return 1
+    print("  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_OFF）")
+    ok, cur = wait_igpu_status("RB_OFF")
+    if ok:
+        print(f"  ✓ 省电账本已归位（{cur}）。")
+    else:
+        print(f"  ! 省电账本未见翻转（{cur or '无回报'}）——GCU 不回报该字段的"
+              "机型无妨，直连主令的账本确认才是关键凭证。")
+    return 0
+
+
+def _direct_cancel_restore_eco(st: DisplayModeState) -> int:
+    """省电态发起的直连被取消：撤回 TOGGLE_ON 后把省电原状补齐。
+
+    取消必须真能取消：普通省电态补发 RB_ON 重开省电账本（MUX 本就在 OFF 位，
+    账本归位即回原状）；账外省电态补发 TOGGLE_IGPU 把直连账本翻回 IGPU 位。
+    补发失败如实报错——物理仍在省电态未重启，账本偏差用 --status 可查。
+    """
+    if _is_toggle_igpu_ledger(st):
+        print("\n--- 补发账外省电原状（TOGGLE_IGPU 翻回直连账本 IGPU 位）---")
+        status, _ev = gcu_mqtt_command(GCU_DIRECT_IGPU_CMD, listen_secs=2.0)
+        if status != "ok":
+            print(f"X 补发失败：{status}——直连账本停在 OFF 位（重启落混合），"
+                  "物理仍省电未动。")
+            print("  可稍后重跑 --eco 或 --status 查看账本。")
+            return 1
+        ok, cur = wait_direct_status("TOGGLE_IGPU")
+        if not ok:
+            print(f"X 直连账本未翻回 IGPU 位（当前: {cur or '无回报'}）——"
+                  "重启会落混合，物理仍省电。")
+            return 1
+        print("  ✓ 已回到账外省电原状（直连账本 = TOGGLE_IGPU），无需重启。")
+        return 0
+    print("\n--- 补发省电原状（重开省电账本 RB_ON）---")
+    status, _ev = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=2.0)
+    if status != "ok":
+        print(f"X 补发失败：{status}——省电账本停在 OFF（重启落混合），物理仍省电未动。")
+        return 1
+    ok, cur = wait_igpu_status("RB_ON")
+    if not ok:
+        print(f"X 省电账本未见翻回（当前: {cur or '无回报'}）——重启会落混合，"
+              "物理仍省电。")
+        return 1
+    print("  ✓ 已回到省电原状（省电账本 = RB_ON），无需重启。")
+    return 0
+
+
 def _direct_capability_gate(required_action: str) -> tuple[GcuInfo | None, int]:
     """直连编排的能力/词表前置（cmd_direct_on/off 共用）。
 
@@ -2762,10 +2889,12 @@ def _direct_capability_gate(required_action: str) -> tuple[GcuInfo | None, int]:
 
 
 def cmd_direct_on() -> int:
-    """混合 → 独显直连（MUX 切换，重启生效；方案 §三 E cmd_direct_on）。
+    """混合/省电 → 独显直连（MUX 切换，重启生效；方案 §三 E cmd_direct_on）。
 
-    省电态下自动串联：先 IGPU_ONLY_CONNECT_RB_OFF（复用 cmd_eco_off 发令与
-    验证段）等独显回线，再继续直连——一次命令完成。
+    省电态走 _direct_eco_ledger_preflight 归位账本（账外态 TOGGLE_OFF 翻回 +
+    RB_OFF），随后直连主令 TOGGLE_ON → 重启三选，一次重启直达直连——对齐
+    官方 SwitchGpuMode(0→2)，不再死等独显热回线（2026-11-20 40 系真机定案：
+    Gen40 无热切换词汇，回线重启才兑现，死等只会把三选卡死在半路）。
     """
     print("=== 独显直连切换编排（探测 → 发令 → GCU 确认 → 重启三选）===")
     info, rc = _direct_capability_gate("DGPU_DIRECT_CONNECT_TOGGLE_ON")
@@ -2789,15 +2918,8 @@ def cmd_direct_on() -> int:
     if st.mode == "direct_pending":
         print("\n检测到「退出直连」的待重启指令——重发直连命令，回到直连目标。")
     if st.mode == "igpu_only":
-        print("\n当前为核显省电态：自动串联「恢复混合」等独显回线，再继续直连…")
-        try:
-            adapters = enumerate_adapters()
-        except OSError:
-            adapters = []
-        if cmd_eco_off(adapters) != 0:
-            print("\nX 独显未回线（恢复混合未完成），中止直连编排。")
+        if _direct_eco_ledger_preflight(st) != 0:
             return 1
-        print("\n--- 独显已回线，继续直连 ---")
 
     print("\n--- 发送直连命令（GCU 控制通道，纯 Action 报文与控制中心同路线）---")
     status, events = gcu_mqtt_command(GCU_DIRECT_ON_CMD, listen_secs=2.0)
@@ -2844,9 +2966,15 @@ def cmd_direct_on() -> int:
     if choice == "2":
         print("  保持待重启态：稍后自行重启即完成直连（--status 显示待重启态）。")
         return 0
-    return _direct_cancel_revert(
+    rc = _direct_cancel_revert(
         GCU_DIRECT_OFF_CMD, "DGPU_DIRECT_CONNECT_TOGGLE_OFF", "TOGGLE_OFF",
-        "保持混合模式", "可重跑 --direct off 撤回")
+        "已退出直连指令，保持混合模式" if st.mode != "igpu_only" else "已退出直连指令",
+        "可重跑 --direct off 撤回")
+    if rc == 0 and st.mode == "igpu_only":
+        # 省电态发起的直连被取消：撤回 TOGGLE_ON 只回到混合账本，还要把
+        # 省电原状补齐（RB_ON / TOGGLE_IGPU），世界才和点按钮前一模一样
+        rc = _direct_cancel_restore_eco(st)
+    return rc
 
 
 def cmd_direct_off() -> int:
@@ -2927,8 +3055,9 @@ def cmd_hybrid() -> int:
     """统一「回混合」入口（--hybrid / GUI「混合模式」按钮）：按当前态自动路由。
 
     目标态式入口，与控制中心「选目标、路径自挑」同思路——两条回混合的路
-    协议不同（省电态走 MQTT 让独显回线、无需重启；直连态走 MUX 切换、重启
-    生效），但用户只关心目的地：
+    协议不同（省电态走 MQTT 让独显回线：30/50 系热切通、40 系无热切换词汇
+    重启才兑现，落入待重启时给重启二选；直连态走 MUX 切换、重启生效），
+    但用户只关心目的地：
     hybrid → 无事可做；igpu_only → 复用 cmd_eco_off；
     dgpu_direct / direct_pending → 复用 cmd_direct_off；
     pnp_disabled / unknown → 拒绝（先恢复干净混合态再操作）。
@@ -2936,7 +3065,7 @@ def cmd_hybrid() -> int:
     st = read_display_mode_state()
     enrich_with_gcu_status(st)
     if st.mode == "igpu_only":
-        print("=== 回混合模式：核显省电 → 混合（MQTT，独显回线，无需重启）===")
+        print("=== 回混合模式：核显省电 → 混合（MQTT 让独显回线）===")
         try:
             adapters = enumerate_adapters()
         except OSError:
@@ -2980,12 +3109,13 @@ def main() -> int:
     ap.add_argument("--direct", nargs="?", const="on", choices=["on", "off"],
                     metavar="{on,off}",
                     help="独显直连切换（MUX 切换，重启后生效）："
-                         "on = 发直连命令并确认，重启三选（默认；核显省电态自动先串联恢复混合）；"
+                         "on = 发直连命令并确认，重启三选（默认；核显省电态自动归位省电账本，"
+                         "一次重启直达直连）；"
                          "off = 直连回混合，同构编排")
     ap.add_argument("--hybrid", action="store_true",
                     help="切回混合模式（目标态入口，按当前态自动路由）："
-                         "核显省电态走 MQTT 恢复混合（无需重启）；直连/待重启态走 MUX 切换"
-                         "（重启三选）；已混合则无事可做")
+                         "核显省电态走 MQTT 恢复混合（30/50 系热切；40 系可能需重启兑现，"
+                         "编排会提示）；直连/待重启态走 MUX 切换（重启三选）；已混合则无事可做")
     ap.add_argument("--gcu-info", action="store_true",
                     help="打印 GCU 探测结果（代际/词表/能力位/意图回报，诊断入口）")
     ap.add_argument("--status", action="store_true",

@@ -1060,7 +1060,7 @@ class App:
     def run_switch(self, target: str):
         """target: direct_on（独显直连）/ hybrid（回混合，按态自动路由）/ on（核显省电）。
 
-        hybrid/direct 方向不杀进程不动 PnP（省电态串联的 cmd_eco_off 同样无需提权），
+        hybrid/direct 方向不杀进程不动 PnP（省电态的账本归位前置同样无需提权），
         eco on 仅混合态清场路径要求管理员（直连态 MUX 重启编排不清场）——与 CLI 口径一致。
         """
         if self.switch_running:
