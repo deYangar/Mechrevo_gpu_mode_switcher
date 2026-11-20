@@ -1913,33 +1913,10 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
         return 1
     print("（已提权运行）")
 
-    # ① 抓独显持有清单，按可关闭/系统组件分类（过滤已退出的陈旧实例）
-    time.sleep(0.5)  # 引擎利用率是 rate 计数器，需要真实间隔才有读数
-    candidates: list[dict] = []  # 用户软件，可关闭候选
-    skipped: list[dict] = []     # 系统/服务/受保护组件
-    stale = 0
-    for gpu in sample_once(counters, adapters_meta, include_all=False):
-        for r in gpu["processes"]:
-            alive, protected = classify_pid(r["pid"])
-            if not alive:
-                stale += 1
-                continue
-            if protected or proc_name(r["image"]).lower() in PROTECTED_PROCESSES \
-                    or r["image"].startswith("<"):
-                skipped.append(r)
-            else:
-                candidates.append(r)
+    # ① 抓独显持有清单（collect_gpu_holders 两口径，清场与 reconcile 错位纠正共用）
+    candidates, skipped, drv_holders, stale = collect_gpu_holders(counters, adapters_meta)
     if stale:
         print(f"（已过滤陈旧计数器实例 {stale} 个：进程已退出）")
-
-    # ①b 驱动层口径：NVAPI/NVML 模块持有者。传感器轮询类软件（HWiNFO 等）不创建
-    #     WDDM 图形上下文，① 抓不到它们，但 GCU 判据看得到（2026-11-11 实测教训）。
-    #     区分两类：持续轮询类（NVML/NVAPI 反复查询）实测挡判据；仅加载 nvapi64
-    #     不轮询类（Steam/Everything）2026-11-16 --keep 实测不挡判据、切换 2 发即过
-    wddm_pids = {r["pid"] for r in candidates} | {r["pid"] for r in skipped}
-    drv_holders = [(pid, name, mods) for pid, name, mods in
-                   nv_module_holders(PROTECTED_PROCESSES)
-                   if pid not in wddm_pids]
 
     # ② 分类提示 + 选择；关闭 = 按进程名强杀全部同名实例（含子进程树）
     keep = {n.lower() for n in keep_names} if keep_names else set()
@@ -2081,6 +2058,78 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
     return 1
 
 
+def collect_gpu_holders(counters: GpuCounters, adapters_meta: list[Adapter]) \
+        -> tuple[list[dict], list[dict], list[tuple[int, str, set[str]]], int]:
+    """抓独显持有清单（WDDM 图形上下文 + NVAPI/NVML 驱动层两口径）。
+
+    返回 (candidates, skipped, drv_holders, stale)：可关闭候选（用户软件）、
+    系统/服务/受保护组件、驱动层模块持有者、已退出的陈旧实例数。
+    eco on 清场与 reconcile 错位纠正共用同一口径。
+    驱动层口径备注：传感器轮询类软件（HWiNFO 等）不创建 WDDM 图形上下文，
+    上下文口径抓不到，但 GCU 判据看得到（2026-11-11 实测教训）；持续轮询类
+    实测挡判据，仅加载 nvapi64 不轮询类（Steam/Everything）实测不挡。
+    """
+    time.sleep(0.5)  # 引擎利用率是 rate 计数器，需要真实间隔才有读数
+    candidates: list[dict] = []  # 用户软件，可关闭候选
+    skipped: list[dict] = []     # 系统/服务/受保护组件
+    stale = 0
+    for gpu in sample_once(counters, adapters_meta, include_all=False):
+        for r in gpu["processes"]:
+            alive, protected = classify_pid(r["pid"])
+            if not alive:
+                stale += 1
+                continue
+            if protected or proc_name(r["image"]).lower() in PROTECTED_PROCESSES \
+                    or r["image"].startswith("<"):
+                skipped.append(r)
+            else:
+                candidates.append(r)
+    wddm_pids = {r["pid"] for r in candidates} | {r["pid"] for r in skipped}
+    drv_holders = [(pid, name, mods) for pid, name, mods in
+                   nv_module_holders(PROTECTED_PROCESSES)
+                   if pid not in wddm_pids]
+    return candidates, skipped, drv_holders, stale
+
+
+def _gcu_wait_ready(max_secs: float = 180.0, poll_secs: float = 2.0) -> bool:
+    """等 GCU 控制通道就绪（GETSTATUS 有应答）——对 GCU 启动速度零假设。
+
+    RunOnce 在登录时跑，GCUService（系统服务）可能尚未起来：轮询到它应答
+    为止；180s 上限只是防御性封顶，正常服务几秒内就绪。就绪判定要求 events
+    非空——MQTT 通了但 GCU 没应答视为未就绪（broker 常驻而 GCU 后起）。
+    """
+    deadline = time.time() + max_secs
+    rnd = 0
+    while time.time() < deadline:
+        status, events = gcu_mqtt_command(GCU_GETSTATUS_CMD, listen_secs=poll_secs)
+        if status == "ok" and events:
+            return True
+        rnd += 1
+        if rnd % 5 == 1:
+            print(f"  … 等待 GCU 控制通道就绪（已等 {rnd * poll_secs:.0f}s，"
+                  "服务可能仍在启动）")
+    return False
+
+
+def _send_eco_on_command(context: str) -> bool:
+    """发 IGPU_RB_ON（省电开关同款命令）并打回报。返回命令是否送达。
+
+    判据被拒（码 1）不算送达失败——调用方后续 wait_for_mode 给最终判定。
+    """
+    for attempt in range(1, 3):
+        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
+                                          stop_keys=("IGpuOnlyConnectionSwitch_Status",
+                                                     "CheckDGpuStatusforIGpuOnlyOnSuccess"))
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}（{context}）")
+            return False
+        print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
+        print_gcu_events(events)
+        if not gcu_rejected(events):
+            break
+    return True
+
+
 def _is_toggle_igpu_ledger(st: DisplayModeState) -> bool:
     """账外省电态判定：直连账本挂着 TOGGLE_IGPU（直连直达落下的态）。
 
@@ -2090,80 +2139,143 @@ def _is_toggle_igpu_ledger(st: DisplayModeState) -> bool:
     return "DGPU_DIRECT_CONNECT_TOGGLE_IGPU" in (st.gcu_direct_status or "").upper()
 
 
+def _reconcile_misalign_recover() -> int:
+    """错位纠正：账面省电 ON、物理独显在线（重启过渡期对齐被占用软件挡住）。
+
+    看证据不看时间：无人持有 → GCU 对齐应能自愈，等它；有持有 → 判据必被
+    挡，清场（无人值守 auto 语义：杀可关闭候选与驱动层持有者，跳过系统组件）
+    后补发省电命令并验证断电。杀不净如实记录，不弹窗打扰登录。
+    """
+    try:
+        counters = GpuCounters()
+    except OSError as e:
+        print(f"X 计数器打开失败，无法清场纠正：{e}")
+        return 1
+    try:
+        try:
+            adapters = enumerate_adapters()
+        except OSError:
+            adapters = []
+        candidates, _skipped, drv_holders, stale = collect_gpu_holders(counters, adapters)
+        if stale:
+            print(f"（已过滤陈旧计数器实例 {stale} 个）")
+
+        if not candidates and not drv_holders:
+            print("\n独显在线但无用户软件持有——GCU 对齐应能自愈，等它完成（上限 30s）…")
+            res = wait_for_mode("igpu_only", timeout_sec=30.0)
+            if res.mode == "igpu_only":
+                print("  ✓ GCU 已自行完成省电对齐。")
+                return 0
+            print("  30s 后独显仍在线，复查持有、按被挡处理…")
+            candidates, _skipped, drv_holders, _stale = collect_gpu_holders(counters, adapters)
+
+        if candidates or drv_holders:
+            print(f"\n--- 清场（无人值守：图形上下文 {len(candidates)} 个 + 驱动层 {len(drv_holders)} 个）---")
+            if candidates:
+                print_eco_rows(candidates, f"图形上下文持有（{len(candidates)} 个）")
+            for pid, name, mods in drv_holders:
+                print(f"  pid {pid:<7} {name}  [{', '.join(sorted(mods))}]")
+            names = sorted({proc_name(r["image"]) for r in candidates} |
+                           {name for _, name, _ in drv_holders})
+            for name in names:
+                ok, msg = kill_by_name(name)
+                tail = "" if ok else f" —— {msg[:120]}"
+                print(f"  {'✓' if ok else '✗'} {name}{tail}")
+            time.sleep(2.0)  # 给 WDDM 上下文销毁留时间
+            # 复查拉回（守护/自启）：如实记录不重杀
+            c2, _s2, drv2, _st2 = collect_gpu_holders(counters, adapters)
+            if c2 or drv2:
+                print("  ! 有持有者被拉回（守护/自启），如下——切换可能仍被挡：")
+                for r in c2:
+                    print(f"    pid {r['pid']:<7} {proc_name(r['image'])}")
+                for pid, name, mods in drv2:
+                    print(f"    pid {pid:<7} {name}  [{', '.join(sorted(mods))}]")
+
+        if not _send_eco_on_command("错位纠正"):
+            return 1
+        print("\n--- 验证省电落位（轮询 PnP/DXGI，上限 60 秒）---")
+        res = wait_for_mode("igpu_only", timeout_sec=60.0)
+        if res.mode == "igpu_only":
+            print("\n✓ 错位已纠正：独显断电，回到核显省电态。")
+            return 0
+        print("\nX 60 秒内独显未断电，错位纠正未完成（占用者可能杀不掉）。当前状态：")
+        print_mode_state(res)
+        print("可稍后手动跑 --eco on（交互清场）或 --status 查看当前持有。")
+        return 1
+    finally:
+        counters.close()
+
+
 def cmd_eco_reconcile() -> int:
-    """账外省电态补账：两本账对齐到官方 UI 的标准省电组合，控制台恢复显示。
+    """省电对账与错位纠正（直连直达省电后的 RunOnce 配套，无人值守幂等）。
 
     官方控制台是二态选择器（独显直连/混合模式）+ 混合下的省电子开关
     （咩咩 2026-11-20 纠正的心智模型）。标准省电组合 = 直连账本 OFF +
-    省电账本 RB_ON（混合选中 + 省电勾上）。TOGGLE_IGPU 直达落下的账外态
-    是直连账本 IGPU 位 + 省电账本 OFF——混合选中判定认 OFF 位，三模档
-    UI 不消费 IGPU 位，于是混合不亮、省电不勾。
-    补账两步（各自独立幂等）：
-    ① 省电账本补 RB_ON——独显已下线判据必过，EC 纯记账；
-    ② 直连账本 IGPU 位补 TOGGLE_OFF 归位——TOGGLE 族重启生效，但 RB_ON
-       是跨重启保持的省电开关：重启后 TOGGLE_OFF 兑现独显回线、RB_ON
-       再拉断，终态应仍是省电（推演，R8 重启验证项）。
-    （RunOnce 无人值守场景，输出走 _Tee 落 logs/eco_reconcile_*.txt）
+    省电账本 RB_ON。三分流：
+    ① 已在省电态：两本账各自独立补齐（RB_ON / TOGGLE_OFF 归位 IGPU 位）；
+    ② 账面 ON 而独显在线（重启过渡期对齐被自启软件抢占挡住）：错位纠正
+       ——等 GCU 就绪后看持有证据决定等自愈还是清场补发；
+    ③ 其他状态：已切走，退出。
+    对 GCU 启动速度零假设：先轮询 GETSTATUS 到应答（上限 180s）再动手。
     """
+    print("=== 省电对账与错位纠正（直连直达省电后的官方控制台识别补齐）===")
+    if not _gcu_wait_ready():
+        print("X GCU 控制通道 180s 内未就绪（GCUService 可能被禁或异常）。")
+        print("  省电开关由 GCU 执行，它不在就无人断电——请检查控制中心后台后手动 --eco on。")
+        return 1
     st = read_display_mode_state()
     enrich_with_gcu_status(st)
-    print("=== 省电账本对账（直连直达省电后的官方控制台识别补齐）===")
     print_mode_state(st)
-    if st.base_mode != "igpu_only":
-        print("\n当前不在核显省电态，无账可补（可能已切换走），退出。")
-        return 0
 
-    info = probe_gcu()
-    ledger_ok = resolve_igpu_status(st.gcu_igpu_status) == 0
-    direct_off_needed = _is_toggle_igpu_ledger(st)
-    if ledger_ok and not direct_off_needed:
-        print("\n✓ 两本账已对齐（省电 ON + 直连 OFF），官方控制台可正常识别。")
-        return 0
+    if st.base_mode == "igpu_only":
+        ledger_ok = resolve_igpu_status(st.gcu_igpu_status) == 0
+        direct_off_needed = _is_toggle_igpu_ledger(st)
+        if ledger_ok and not direct_off_needed:
+            print("\n✓ 已在省电态且两本账对齐（省电 ON + 直连 OFF），无事可做。")
+            return 0
+        info = probe_gcu()
 
-    # ① 省电账本 → ON（混合大类下的省电子开关勾上）
-    if not ledger_ok:
-        if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
-            print("\nX 本机不支持省电账本命令，无法补账（能力位/词表如上）。")
-            return 1
-        print("\n--- 发送补账命令 ①（省电开关同款；独显已下线，判据必过）---")
-        for attempt in range(1, 3):
-            status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
-                                              stop_keys=("IGpuOnlyConnectionSwitch_Status",
-                                                         "CheckDGpuStatusforIGpuOnlyOnSuccess"))
-            if status != "ok":
-                print(f"X GCU 控制通道不可用：{status}（RunOnce 场景请确认 GCUService 已启动）")
+        # ① 省电账本 → ON（混合大类下的省电子开关勾上；独显已下线判据必过）
+        if not ledger_ok:
+            if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+                print("\nX 本机不支持省电账本命令，无法补账（能力位/词表如上）。")
                 return 1
-            print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
-            print_gcu_events(events)
-            if not gcu_rejected(events):
-                break
-        print("\n--- 等待省电账本翻 ON（GETSTATUS 复查，5×1.8s）---")
-        ok, cur = wait_igpu_status("IGPU_ONLY_CONNECT_RB_ON")
-        if not ok:
-            print(f"X 省电账本未翻转（当前: {cur or '无回报'}）——官方控制台可能仍无法识别。")
-            print("  可稍后手动重跑 --eco reconcile，或 --status 查看当前账本。")
-            return 1
-        print(f"  ✓ 省电账本已翻 ON（{cur}）。")
+            print("\n--- 补账 ① 省电账本翻 ON（独显已下线，判据必过）---")
+            if not _send_eco_on_command("账本补齐"):
+                return 1
+            print("\n--- 等待省电账本翻 ON（GETSTATUS 复查，5×1.8s）---")
+            ok, cur = wait_igpu_status("IGPU_ONLY_CONNECT_RB_ON")
+            if not ok:
+                print(f"X 省电账本未翻转（当前: {cur or '无回报'}）——可重跑 --eco reconcile。")
+                return 1
+            print(f"  ✓ 省电账本已翻 ON（{cur}）。")
 
-    # ② 直连账本 IGPU 位 → OFF 位（UI 的「混合模式」选中判定认的就是它）
-    if direct_off_needed:
-        if info.dgpu_direct is False or "DGPU_DIRECT_CONNECT_TOGGLE_OFF" not in info.vocab:
-            print("\nX 本机词表不含 TOGGLE_OFF，直连账本无法归位（省电开关账已对齐）。")
-            return 1
-        print("\n--- 发送补账命令 ②（直连账本 IGPU 位归位 OFF，控制台混合模式恢复选中）---")
-        status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
-        if status != "ok":
-            print(f"X GCU 控制通道不可用：{status}——省电账已对齐，直连账本归位可重跑补账。")
-            return 1
-        print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
-        print_gcu_events(events)
-        ok, cur = wait_direct_status("TOGGLE_OFF")
-        if not ok:
-            print(f"X 直连账本未翻转（当前: {cur or '无回报'}）——可重跑 --eco reconcile 补。")
-            return 1
-        print(f"  ✓ 直连账本已归位 OFF（{cur}）——两本账对齐，官方控制台恢复显示")
-        print("    （混合模式选中 + 省电勾上。TOGGLE_OFF 重启生效；省电开关跨重启保持，")
-        print("     重启后终态应仍是省电——R8 验证项，落混合则如实报）")
+        # ② 直连账本 IGPU 位 → OFF 位（UI 的「混合模式」选中判定认的就是它）
+        if direct_off_needed:
+            if info.dgpu_direct is False or "DGPU_DIRECT_CONNECT_TOGGLE_OFF" not in info.vocab:
+                print("\nX 本机词表不含 TOGGLE_OFF，直连账本无法归位（省电开关账已对齐）。")
+                return 1
+            print("\n--- 补账 ② 直连账本 IGPU 位归位 OFF（控制台混合模式恢复选中）---")
+            status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
+            if status != "ok":
+                print(f"X GCU 控制通道不可用：{status}——省电账已对齐，可重跑 --eco reconcile 补。")
+                return 1
+            print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
+            print_gcu_events(events)
+            ok, cur = wait_direct_status("TOGGLE_OFF")
+            if not ok:
+                print(f"X 直连账本未翻转（当前: {cur or '无回报'}）——可重跑 --eco reconcile 补。")
+                return 1
+            print(f"  ✓ 直连账本已归位 OFF（{cur}）——两本账对齐，官方控制台恢复显示")
+            print("    （混合选中 + 省电勾上；重启后过渡几十秒独显在线，GCU 起来会拉回省电，")
+            print("     被自启软件抢占则由本命令的错位纠正段兜底）")
+        return 0
+
+    if st.base_mode == "hybrid" and resolve_igpu_status(st.gcu_igpu_status) == 0:
+        print("\n检测到错位：省电开关记 ON 但独显在线（重启过渡期对齐被挡？）——纠正。")
+        return _reconcile_misalign_recover()
+
+    print("\n当前不在省电相关状态（可能已切换走），无账可补，退出。")
     return 0
 
 
