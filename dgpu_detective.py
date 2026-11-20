@@ -2091,12 +2091,18 @@ def _is_toggle_igpu_ledger(st: DisplayModeState) -> bool:
 
 
 def cmd_eco_reconcile() -> int:
-    """账外省电态补账：发 IGPU_RB_ON 把省电账本翻 ON，官方控制台恢复显示。
+    """账外省电态补账：两本账对齐到官方 UI 的标准省电组合，控制台恢复显示。
 
-    直连→省电直达（TOGGLE_IGPU）落下的态里省电账本没参与（记 RB_OFF），
-    官方 UI 因此失明。本命令在省电态下补发省电开关同款命令——独显已下线、
-    判据必过，EC 纯记账；补完直连账本 TOGGLE_IGPU + 省电账本 RB_ON，
-    官方 UI 三态恢复（省电亮）。幂等：不在省电态或账已对齐则直接退出。
+    官方控制台是二态选择器（独显直连/混合模式）+ 混合下的省电子开关
+    （咩咩 2026-11-20 纠正的心智模型）。标准省电组合 = 直连账本 OFF +
+    省电账本 RB_ON（混合选中 + 省电勾上）。TOGGLE_IGPU 直达落下的账外态
+    是直连账本 IGPU 位 + 省电账本 OFF——混合选中判定认 OFF 位，三模档
+    UI 不消费 IGPU 位，于是混合不亮、省电不勾。
+    补账两步（各自独立幂等）：
+    ① 省电账本补 RB_ON——独显已下线判据必过，EC 纯记账；
+    ② 直连账本 IGPU 位补 TOGGLE_OFF 归位——TOGGLE 族重启生效，但 RB_ON
+       是跨重启保持的省电开关：重启后 TOGGLE_OFF 兑现独显回线、RB_ON
+       再拉断，终态应仍是省电（推演，R8 重启验证项）。
     （RunOnce 无人值守场景，输出走 _Tee 落 logs/eco_reconcile_*.txt）
     """
     st = read_display_mode_state()
@@ -2106,34 +2112,58 @@ def cmd_eco_reconcile() -> int:
     if st.base_mode != "igpu_only":
         print("\n当前不在核显省电态，无账可补（可能已切换走），退出。")
         return 0
-    if resolve_igpu_status(st.gcu_igpu_status) == 0:
-        print("\n✓ 省电账本已记 ON（对齐），官方控制台可正常识别，无需补账。")
-        return 0
 
     info = probe_gcu()
-    if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
-        print("\nX 本机不支持省电账本命令，无法补账（能力位/词表如上）。")
-        return 1
+    ledger_ok = resolve_igpu_status(st.gcu_igpu_status) == 0
+    direct_off_needed = _is_toggle_igpu_ledger(st)
+    if ledger_ok and not direct_off_needed:
+        print("\n✓ 两本账已对齐（省电 ON + 直连 OFF），官方控制台可正常识别。")
+        return 0
 
-    print("\n--- 发送补账命令（省电开关同款；独显已下线，判据必过）---")
-    for attempt in range(1, 3):
-        status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
-                                          stop_keys=("IGpuOnlyConnectionSwitch_Status",
-                                                     "CheckDGpuStatusforIGpuOnlyOnSuccess"))
-        if status != "ok":
-            print(f"X GCU 控制通道不可用：{status}（RunOnce 场景请确认 GCUService 已启动）")
+    # ① 省电账本 → ON（混合大类下的省电子开关勾上）
+    if not ledger_ok:
+        if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+            print("\nX 本机不支持省电账本命令，无法补账（能力位/词表如上）。")
             return 1
-        print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
+        print("\n--- 发送补账命令 ①（省电开关同款；独显已下线，判据必过）---")
+        for attempt in range(1, 3):
+            status, events = gcu_mqtt_command(GCU_ECO_ON_CMD, listen_secs=8.0,
+                                              stop_keys=("IGpuOnlyConnectionSwitch_Status",
+                                                         "CheckDGpuStatusforIGpuOnlyOnSuccess"))
+            if status != "ok":
+                print(f"X GCU 控制通道不可用：{status}（RunOnce 场景请确认 GCUService 已启动）")
+                return 1
+            print(f"  ✓ 命令已送达（IGPU_ONLY_CONNECT_RB_ON，第 {attempt} 次）")
+            print_gcu_events(events)
+            if not gcu_rejected(events):
+                break
+        print("\n--- 等待省电账本翻 ON（GETSTATUS 复查，5×1.8s）---")
+        ok, cur = wait_igpu_status("IGPU_ONLY_CONNECT_RB_ON")
+        if not ok:
+            print(f"X 省电账本未翻转（当前: {cur or '无回报'}）——官方控制台可能仍无法识别。")
+            print("  可稍后手动重跑 --eco reconcile，或 --status 查看当前账本。")
+            return 1
+        print(f"  ✓ 省电账本已翻 ON（{cur}）。")
+
+    # ② 直连账本 IGPU 位 → OFF 位（UI 的「混合模式」选中判定认的就是它）
+    if direct_off_needed:
+        if info.dgpu_direct is False or "DGPU_DIRECT_CONNECT_TOGGLE_OFF" not in info.vocab:
+            print("\nX 本机词表不含 TOGGLE_OFF，直连账本无法归位（省电开关账已对齐）。")
+            return 1
+        print("\n--- 发送补账命令 ②（直连账本 IGPU 位归位 OFF，控制台混合模式恢复选中）---")
+        status, events = gcu_mqtt_command(GCU_DIRECT_OFF_CMD, listen_secs=2.0)
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}——省电账已对齐，直连账本归位可重跑补账。")
+            return 1
+        print("  ✓ 命令已送达（DGPU_DIRECT_CONNECT_TOGGLE_OFF）")
         print_gcu_events(events)
-        if not gcu_rejected(events):
-            break
-    print("\n--- 等待省电账本翻 ON（GETSTATUS 复查，5×1.8s）---")
-    ok, cur = wait_igpu_status("IGPU_ONLY_CONNECT_RB_ON")
-    if not ok:
-        print(f"X 省电账本未翻转（当前: {cur or '无回报'}）——官方控制台可能仍无法识别。")
-        print("  可稍后手动重跑 --eco reconcile，或 --status 查看当前账本。")
-        return 1
-    print(f"  ✓ 省电账本已翻 ON（{cur}）——官方控制台的核显省电恢复显示。")
+        ok, cur = wait_direct_status("TOGGLE_OFF")
+        if not ok:
+            print(f"X 直连账本未翻转（当前: {cur or '无回报'}）——可重跑 --eco reconcile 补。")
+            return 1
+        print(f"  ✓ 直连账本已归位 OFF（{cur}）——两本账对齐，官方控制台恢复显示")
+        print("    （混合模式选中 + 省电勾上。TOGGLE_OFF 重启生效；省电开关跨重启保持，")
+        print("     重启后终态应仍是省电——R8 验证项，落混合则如实报）")
     return 0
 
 
