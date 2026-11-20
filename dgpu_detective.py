@@ -902,11 +902,62 @@ def print_mode_state(st: DisplayModeState) -> None:
 # 通用化改造（方案 §2.1）：clientId 槽位回退链 _4 → _3 → _2，CONNACK 被拒换下一槽，
 # 三槽全被拒才报「通道不可用」（one-shot 短连接无需 L-Mechrevo 的「恢复首选」逻辑）。
 GCU_MQTT_HOST, GCU_MQTT_PORT = "127.0.0.1", 13688
-GCU_MQTT_SLOTS = (  # (clientId, user, pass)，与 MechrevoHw.cs 凭据常量一一对应
-    ("UWPClient_4", "UWPClient_User_4", "UWPClient_Pwd888881772688_4"),
-    ("UWPClient_3", "UWPClient_User_3", "UWPClient_Pwd888881772688_3"),
-    ("UWPClient_2", "UWPClient_User_2", "UWPClient_Pwd888881772688_2"),
-)
+_GCU_PWD_SALT = "888881772688"  # 密码常量，三代一致（E1：40 系 GCUBridge ClientManager 实录）
+
+
+def gcu_credential_prefix() -> tuple[str, str]:
+    """凭据前缀分线（E2，40 系 GCUBridge MQTTServer.InitialzeClient 实录）。
+
+    读 HKLM\\SOFTWARE\\OEM\\{GamingCenter2,GamingCenter,ControlCenter} 的
+    BridgeType / CustomizeTarget（双视图，首见值优先）。BridgeType==1 时按
+    CustomizeTarget 分线：16/25→UWPIntelClient、29→UWPADATAClient、其他→
+    UWPSTDClient；否则 UWPClient。返回 (前缀, 判定依据描述)；读不到或值
+    不可解析一律 ("UWPClient", "默认（注册表无线索）")。
+    """
+    roots = (r"SOFTWARE\OEM\GamingCenter2", r"SOFTWARE\OEM\GamingCenter",
+             r"SOFTWARE\OEM\ControlCenter")
+    values: dict[str, str] = {}
+    for root in roots:
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0,
+                                    winreg.KEY_READ | view) as k:
+                    for name in ("BridgeType", "CustomizeTarget"):
+                        if name in values:
+                            continue  # 首见值优先（与 read_gcu_registry_caps 的 TryAdd 同口径）
+                        try:
+                            v, _t = winreg.QueryValueEx(k, name)
+                        except OSError:
+                            continue
+                        values[name] = str(v)
+            except OSError:
+                continue
+    try:
+        bridge = int(values.get("BridgeType", "").strip())
+    except ValueError:
+        return "UWPClient", "默认（注册表无线索）"
+    if bridge != 1:
+        return "UWPClient", f"默认族（BridgeType={bridge}≠1）"
+    try:
+        target = int(values.get("CustomizeTarget", "").strip())
+    except ValueError:
+        return "UWPClient", "默认（BridgeType=1 但 CustomizeTarget 缺失/不可解析）"
+    if target in (16, 25):
+        return "UWPIntelClient", f"BridgeType=1，CustomizeTarget={target}（Intel 线）"
+    if target == 29:
+        return "UWPADATAClient", "BridgeType=1，CustomizeTarget=29（ADATA 线）"
+    return "UWPSTDClient", f"BridgeType=1，CustomizeTarget={target}（STD 线）"
+
+
+def gcu_mqtt_slots() -> tuple[tuple[str, str, str], ...]:
+    """按前缀生成槽位三元组（E1 公式），槽位顺序 _4 → _3 → _2 不变。"""
+    prefix, _src = gcu_credential_prefix()
+    return tuple(
+        (f"{prefix}_{n}", f"{prefix}_User_{n}", f"{prefix}_Pwd{_GCU_PWD_SALT}_{n}")
+        for n in (4, 3, 2))
+
+
+GCU_MQTT_SLOTS = gcu_mqtt_slots()  # 兼容旧名（模块加载时求值）；连接时现算，注册表运行中可见
 GCU_ECO_ON_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_ON", "SetToWMIEC": "OK"}'
 GCU_ECO_OFF_CMD = '{"Action": "IGPU_ONLY_CONNECT_RB_OFF", "SetToWMIEC": "OK"}'
 # 直连命令（方案 §2.4 V1 定案）：纯 Action 报文，不带 SetToWMIEC
@@ -917,6 +968,9 @@ GCU_DIRECT_OFF_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_OFF"}'
 GCU_DIRECT_IGPU_CMD = '{"Action": "DGPU_DIRECT_CONNECT_TOGGLE_IGPU"}'
 GCU_DIRECT_RESTART_CMD = '{"Action": "DGPU_DIRECT_CONNECT_RESTART"}'
 GCU_GETSTATUS_CMD = '{"Action": "GETSTATUS"}'
+# 30/40 常规机型官方省电（lite）：纯 Action、toggle 语义（E4：MechrevoService.
+# SwitchGpuPowerSaving 实录，发送后仅记日志不等确认；服务端按 currentSaveingMode 翻转）
+GCU_ECO_LITE_CMD = '{"Action": "GPU_POWERSAVEINGMODE"}'
 
 
 def _mqtt_enc_len(n: int) -> bytes:
@@ -983,7 +1037,7 @@ def _mqtt_connect_slot() -> tuple[socket.socket | None, str]:
     """
     global GCU_LAST_CLIENT_ID
     rejected: list[str] = []
-    for client_id, user, pwd in GCU_MQTT_SLOTS:
+    for client_id, user, pwd in gcu_mqtt_slots():
         try:
             sock = socket.create_connection((GCU_MQTT_HOST, GCU_MQTT_PORT), timeout=5)
         except OSError as e:
@@ -1185,8 +1239,16 @@ def gcu_rejected(events: list[tuple[str, str]]) -> bool:
 # ---------------------------------------------------------------------------
 
 # dGPU 代际词表（DisplayRouteMatrix.cs 实录的 ConsoleActions 证据矩阵，方案 §1.3）
+# 运行时省电族（E11：30/40/50 三代 UI bytes 全有；30/40 常规机型的官方省电走这族，
+# 与 IGPU_ONLY 族的三模硬件省电是两码事——不停 EC、只断输出+降刷新率+PnP 软禁用）
+POWERSAVE_LITE_ACTIONS = frozenset({
+    "GPU_POWERSAVEINGMODE",       # 省电总开关（toggle，E4）
+    "GPU_DC_ONCE", "GPU_DC_HZ", "GPU_MODE_HZ",
+    "GPU_DISCONNECTMONITOR", "GPU_HZSETTING",
+})
 GEN30_ACTIONS = frozenset({
-    "DGPU_DIRECT_CONNECT_TOGGLE_ON", "DGPU_DIRECT_CONNECT_TOGGLE_OFF"})
+    "DGPU_DIRECT_CONNECT_TOGGLE_ON", "DGPU_DIRECT_CONNECT_TOGGLE_OFF"}) | POWERSAVE_LITE_ACTIONS
+# GEN40_DUAL / GEN40_TRI / GEN50 均继承 GEN30，自动带上 lite 族
 GEN40_DUAL_ACTIONS = GEN30_ACTIONS | {
     "DGPU_DIRECT_CONNECT_TOGGLE_IGPU", "DGPU_DIRECT_CONNECT_RESTART"}
 GEN40_TRI_ACTIONS = GEN40_DUAL_ACTIONS | {
@@ -1332,7 +1394,7 @@ class GcuInfo:
     generation: str                 # gen30/gen40/gen50/no_dgpu/unknown
     gen_source: str                 # 代际判定依据
     vocab: set[str]                 # 本机代际词表（词表外命令不发）
-    three_mode: bool | None         # Gen40 三模档判定（True/False/None=非 Gen40）
+    three_mode: bool | None         # Gen40 档位（True=三模/False=双模/None=未定或非 Gen40）
     igpu_only: bool | None          # 核显省电能力（None = 探测不可得）
     dgpu_direct: bool | None        # 独显直连能力
     igpu_source: str                # 能力位来源（在线回报/注册表/不可得）
@@ -1344,6 +1406,8 @@ class GcuInfo:
     igpu_status: str
     raw: dict                       # GETSTATUS 回报原始字段留档
     client_id: str = ""             # 实际连上的槽位（回退链观测，R4）
+    credential_prefix: str = ""     # MQTT 凭据前缀（E2 分线；空=未探测）
+    credential_source: str = ""     # 前缀判定依据描述（默认族/Intel 线/STD 线…）
 
 
 def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
@@ -1400,18 +1464,22 @@ def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
         igpu_source = "注册表" if igpu_only is not None else "不可得"
 
     # Gen40 三模档判定：在线回报 iGPUModeOnlySupport 优先，回落注册表
-    #（TierFromCapability 实录：mqtt 有值用 mqtt，否则 persisted 候选）
+    #（TierFromCapability 实录：mqtt 有值用 mqtt，否则 persisted 候选）。
+    # 两源皆空 = 未定（None），不硬判双模——40 系 GCUService 无在线能力字段、
+    # 注册表位在 Gen40 被上游标注不可靠（E8），硬判 False 会误拒三模真机
     three_mode = None
     if gen == "gen40":
         tri = first_optional_bool(raw, "iGPUModeOnlySupport") if raw else None
         if tri is None:
             tri = parse_flexible_bool(first_field(reg, "iGPUModeOnlySupport"))
-        three_mode = bool(tri) if tri is not None else False
+        if tri is not None:
+            three_mode = bool(tri)
 
     if gen == "gen50":
         vocab = set(GEN50_ACTIONS)
     elif gen == "gen40":
-        vocab = set(GEN40_TRI_ACTIONS if three_mode else GEN40_DUAL_ACTIONS)
+        # None=未定 → 给三模全集：宁可多给词表，由能力门禁与实测判据把关，不空手拒绝
+        vocab = set(GEN40_TRI_ACTIONS if three_mode is not False else GEN40_DUAL_ACTIONS)
     elif gen == "gen30":
         vocab = set(GEN30_ACTIONS)
     else:
@@ -1422,6 +1490,7 @@ def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
         hot_swap_note = ("词表含 GPU_HOTSWAP_ON/OFF，但 GCU 处理器为 log-only no-op"
                          "（未证实可用）——不提供热切换路径，仅如实标注")
 
+    prefix, cred_src = gcu_credential_prefix()
     return GcuInfo(connected=connected, connect_note=note, generation=gen,
                    gen_source=gen_source, vocab=vocab, three_mode=three_mode,
                    igpu_only=igpu_only, dgpu_direct=dgpu_direct,
@@ -1429,7 +1498,8 @@ def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
                    hot_swap_note=hot_swap_note, is_mechrevo=mech,
                    identity=identity, direct_status=direct_status,
                    igpu_status=igpu_status, raw=raw,
-                   client_id=(GCU_LAST_CLIENT_ID if connected else ""))
+                   client_id=(GCU_LAST_CLIENT_ID if connected else ""),
+                   credential_prefix=prefix, credential_source=cred_src)
 
 
 def print_gcu_info(info: GcuInfo) -> None:
@@ -1442,8 +1512,11 @@ def print_gcu_info(info: GcuInfo) -> None:
         if k in info.identity:
             print(f"  {k} = {info.identity[k]}")
     print(f"dGPU 代际: {GEN_LABELS.get(info.generation, info.generation)}（{info.gen_source}）")
-    tier = "" if info.three_mode is None else \
-        ("三模档（iGPUModeOnlySupport=1）" if info.three_mode else "双模档（无 IGPU_ONLY_*）")
+    tier = ""
+    if info.generation == "gen40":  # 档位行只对 Gen40 有意义；None=未定也如实报
+        tier = {True: "三模档（iGPUModeOnlySupport=1）",
+                False: "双模档（无 IGPU_ONLY_*）",
+                None: "未定（在线无回报且注册表无线索，按三模词表尝试）"}.get(info.three_mode, "")
     if tier:
         print(f"  Gen40 档位: {tier}")
     print(f"本机词表（{len(info.vocab)} 条，词表外命令不发）:")
@@ -1453,7 +1526,8 @@ def print_gcu_info(info: GcuInfo) -> None:
     print(f"独显直连能力: {_cap_str(info.dgpu_direct)}（来源: {info.dgpu_source}）")
     if info.hot_swap_note:
         print(f"热切换: {info.hot_swap_note}")
-    slot = f"（槽位 {info.client_id}）" if info.client_id else ""
+    slot = f"（槽位 {info.client_id}，前缀 {info.credential_prefix}" \
+           f"：{info.credential_source}）" if info.client_id else ""
     print(f"GCU 通道: {info.connect_note}{slot}")
     if info.connected:
         if info.direct_status or info.igpu_status:
@@ -1868,6 +1942,12 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
         print("\n已在核显省电态（PnP 已断开 + DXGI 不可见），无需切换。")
         return 0
     if st.mode == "pnp_disabled":
+        # lite 机型（词表含 GPU_POWERSAVEINGMODE 且无 MUX 省电能力）上这是官方
+        # 运行时省电的正常落位（E7：PnP 禁卡是 lite 的副作用），不是假切换残留
+        probe = probe_gcu()
+        if "GPU_POWERSAVEINGMODE" in probe.vocab and probe.igpu_only is not True:
+            print("\n已在 lite 省电态（PnP 软禁用，官方运行时省电）。恢复用 --eco lite off。")
+            return 0
         print("\n检测到 PnP 软禁用残留（假切换形态）：设备仍焊在总线上。")
         print("请先在设备管理器启用 NVIDIA 设备（或 gpu_mode_switch 项目 gpu_switch.py off）")
         print("恢复混合模式后，再用本命令走官方真切换。")
@@ -1887,13 +1967,18 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
             print("  或 --direct on 撤回回混合后再切省电。")
             return 1
 
-    # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）：行为不变，仅头部插入
-    # ——30 系等无 IGPU_ONLY_* 词表的机型在这里如实退出，不再空试
+    # 能力前置（通用化改造方案 §三 E「与 eco 的关系」）+ lite 路由（3040 方案 §三）：
+    # 无 MUX 省电档（能力位/词表）但词表含官方运行时省电族 → 改走 lite，
+    # 30 系 / 40 双模档在此自动进 lite；40 未定与 50 系走原路径
     info = probe_gcu()
-    if info.igpu_only is False:
-        print(f"\nX 本机不支持核显省电（能力位来源: {info.igpu_source}）。")
-        return 1
-    if "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+    lite_ok = "GPU_POWERSAVEINGMODE" in info.vocab
+    if info.igpu_only is False or "IGPU_ONLY_CONNECT_RB_ON" not in info.vocab:
+        if lite_ok:
+            print("\n本机无 MUX 核显省电档（能力位/词表），改走官方运行时省电（lite）…")
+            return cmd_eco_lite(on=True)
+        if info.igpu_only is False:
+            print(f"\nX 本机不支持核显省电（能力位来源: {info.igpu_source}）。")
+            return 1
         print(f"\nX rejected: action not in dGPU generation {info.generation} vocabulary")
         print(f"  本机词表不含 IGPU_ONLY_CONNECT_RB_ON"
               f"（{GEN_LABELS.get(info.generation, info.generation)}）。")
@@ -2388,6 +2473,84 @@ def cmd_eco_off(adapters_meta: list[Adapter]) -> int:
     return 1
 
 
+# currentSaveingMode 枚举（E6：40 系 GCService5/GPUPORWERSAVING.cs）：
+# 0=ENABLE / 1=DISABLE / 2=AUTO；回报在 GPUDevice/Status topic（E9 已订阅）
+_LITE_MODE_LABELS = {0: "0=ENABLE（省电开）", 1: "1=DISABLE（省电关）", 2: "2=AUTO（自动）"}
+
+
+def cmd_eco_lite(on: bool) -> int:
+    """官方运行时省电（lite）：GPU_POWERSAVEINGMODE toggle（E4）。
+
+    发令无值字段（toggle 语义，服务端按 currentSaveingMode 翻转）。
+    确认三凭证：GPUDevice/Status 回报 currentSaveingMode 翻转（E6：0=ENABLE
+    1=DISABLE）＋ 本地 nvidia_pnp_states 出现 disabled（E10，PnP 禁卡副作用）
+    ＋ currentHZ 回报变化（240⇄60 联动）。回报事件由 gcu_mqtt_command 现有
+    订阅收（E9，订阅列表已含 GPUDevice/Status）。
+    on=False 即再发一次 toggle（对称恢复，E7 官方成对语义）。
+    """
+    target = 0 if on else 1
+    print(f"=== 官方运行时省电（lite）：GPU_POWERSAVEINGMODE toggle → {'开省电' if on else '关省电'} ===")
+    print("运行时省电 = 断显示输出 + 降刷新率 + 设备软禁用，非整卡断电"
+          "（与三模机型的 EC 级断电不是一个体验）。")
+    print("占用进程不影响 PnP 软禁用，无需清场；被禁前仍占用的软件会在启用后恢复占用。")
+
+    # 发令 → 等 currentSaveingMode 翻转；超时 3 轮重发（对齐官方 UI 盲重发习惯）
+    cur: int | None = None
+    for attempt in range(1, 4):
+        status, events = gcu_mqtt_command(GCU_ECO_LITE_CMD, listen_secs=8.0,
+                                          stop_keys=("currentSaveingMode",))
+        if status != "ok":
+            print(f"X GCU 控制通道不可用：{status}")
+            print("  请确认机械革命控制中心后台（GCUBridge / GCUService）在运行后重试。")
+            return 1
+        print(f"  ✓ 命令已送达（GPU_POWERSAVEINGMODE，第 {attempt} 次）")
+        print_gcu_events(events)
+        v = first_field(merge_gcu_events(events), "currentSaveingMode")
+        if v is not None:
+            try:
+                cur = int(str(v).strip())
+            except ValueError:
+                cur = None
+        if cur == target:
+            break
+        if attempt < 3:
+            print(f"  ! currentSaveingMode 未翻到目标值"
+                  f"（当前: {_LITE_MODE_LABELS.get(cur, cur) if cur is not None else '无回报'}），重发一次…")
+            time.sleep(2.0)
+
+    if cur == target:
+        print(f"\n  ✓ GCU 账本确认：currentSaveingMode = {_LITE_MODE_LABELS[target]}")
+    elif cur is not None:
+        print(f"\nX 三次命令后 currentSaveingMode = {_LITE_MODE_LABELS.get(cur, cur)}"
+            f"（目标 {_LITE_MODE_LABELS[target]}），账本未达预期。")
+        print("  toggle 语义按当前值翻转；若当前值在意料外，先到控制中心 UI 核对省电模式设置。")
+        return 1
+    else:
+        print("\nX 未收到 currentSaveingMode 回报（GPUDevice/Status 在收听窗口内无数据）。")
+        print("  命令已送达但状态不可证；用控制中心 UI 或 --status 人工核对。")
+        return 1
+
+    # 本地凭证轮询：on 后 PnP 软禁用（mode=pnp_disabled）、off 后回在线（hybrid）。
+    # 与回报双确认；只报事实不夸大——PnP 禁用 ≠ EC 断电。
+    target_mode = "pnp_disabled" if on else "hybrid"
+    print(f"\n--- 验证切换（轮询 PnP / DXGI 本地凭证，上限 60 秒）---")
+    res = wait_for_mode(target_mode, timeout_sec=60.0)
+    if res.mode == target_mode:
+        print(f"\n✓ 运行时省电（lite）已{'开启' if on else '关闭、恢复混合'}："
+              "GCU 账本回报 + 本地 PnP 双凭证确认。")
+        print_mode_state(res)
+        return 0
+    print(f"\nX 60 秒内本地凭证未达预期（账本回报 currentSaveingMode = "
+          f"{_LITE_MODE_LABELS[target]}）。当前状态：")
+    print_mode_state(res)
+    if on:
+        print("PnP 软禁用可能滞后于账本回报（或该机型 lite 不做设备禁用，仅断输出）；")
+        print("以控制中心 UI 显示与 --status 实况为准。")
+    else:
+        print("设备重新上线可能滞后；稍后用 --status 复查。")
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # 独显直连切换编排（--direct，方案 §三 E）：MUX 切换重启生效 + 待重启态
 # ---------------------------------------------------------------------------
@@ -2754,11 +2917,14 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="非独显适配器（核显等）也一并报告")
     ap.add_argument("--json", action="store_true", help="JSON 输出（一次性快照）")
     ap.add_argument("--watch", action="store_true", help="持续监视独显持有变化")
-    ap.add_argument("--eco", nargs="?", const="on", choices=["on", "off", "reconcile"],
-                    metavar="{on,off,reconcile}",
+    ap.add_argument("--eco", nargs="*", choices=["on", "off", "lite", "reconcile"],
+                    metavar="{on,off,lite,'lite off',reconcile}",
                     help="核显省电切换编排（全程自动，GCU 控制通道与控制中心同路线）："
                          "on = 检测独显占用并清场后发官方同款命令开启核显省电并验证（默认）；"
                          "off = 发命令切回混合模式并验证；"
+                         "lite = 官方运行时省电（30/40 常规机型：断输出+降刷新率+设备软禁用，"
+                         "非整卡断电）；lite off = 关闭运行时省电恢复混合；"
+                         "无 MUX 省电档的机型 --eco 自动改走 lite；"
                          "reconcile = 账外省电态补账（直连直达落下后对齐官方控制台识别，"
                          "幂等，RunOnce 无人值守自动跑）")
     ap.add_argument("--direct", nargs="?", const="on", choices=["on", "off"],
@@ -2782,6 +2948,16 @@ def main() -> int:
                     help="eco on 清场豁免名单（逗号分隔进程名，不区分大小写）：其余候选照杀、"
                          "豁免者保留在场，用于实测豁免对象是否挡切换判据（无人值守）")
     args = ap.parse_args()
+    # --eco 值归一化：nargs="*" 支持 "lite off" 双词形式，其余收敛回单值字符串
+    if args.eco is not None:
+        if not args.eco:
+            args.eco = "on"                       # 裸 --eco 等同 --eco on
+        elif args.eco == ["lite", "off"]:
+            args.eco = "lite-off"
+        elif len(args.eco) == 1:
+            args.eco = args.eco[0]
+        else:
+            ap.error("参数 --eco 的形式为 on/off/lite/'lite off'/reconcile")
 
     if args.gcu_info:
         print_gcu_info(probe_gcu())
@@ -2853,6 +3029,9 @@ def main() -> int:
 
     if args.eco == "off":
         return cmd_eco_off(adapters_meta)
+
+    if args.eco in ("lite", "lite-off"):
+        return cmd_eco_lite(on=(args.eco == "lite"))
 
     if args.eco == "on":
         try:

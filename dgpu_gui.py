@@ -1079,7 +1079,8 @@ class App:
         titles = {
             "direct_on": "独显直连切换（探测 → 发令 → GCU 确认 → 重启三选）",
             "hybrid": "回混合模式（按当前态自动路由：省电→MQTT 回线 / 直连→MUX 重启三选）",
-            "on": "核显省电切换（混合态：清场+官方同款命令 / 直连态：MUX 重启直达）",
+            "on": "核显省电切换（混合态：清场+官方同款命令 / 直连态：MUX 重启直达；"
+                  "无 MUX 档机型自动改走官方运行时省电）",
         }
         sink.write(f"\n===== {titles.get(target, target)} "
                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
@@ -1248,7 +1249,7 @@ class App:
                      f"tree_w={self.tree.winfo_width()}")
         # 切换编排状态（通用化自测）：GCU 探测与三按钮态
         gi = self.gcu_info
-        lines.append(f"gcu_info: {None if gi is None else (gi.connected, gi.generation, gi.client_id, gi.igpu_only, gi.dgpu_direct)}")
+        lines.append(f"gcu_info: {None if gi is None else (gi.connected, gi.generation, gi.client_id, gi.credential_prefix, gi.igpu_only, gi.dgpu_direct)}")
         lines.append("buttons: " + ",".join(
             f"{str(b.cget('text'))}={b.cget('state')}" for b in self._switch_buttons()))
         lines.append(f"badge: {self.mode_badge.cget('text')!r} evidence: {self.evidence.cget('text')!r}")

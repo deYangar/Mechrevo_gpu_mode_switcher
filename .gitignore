@@ -6,3 +6,11 @@ logs/
 build/
 dist/
 test_artifacts/
+# 内部开发文档（不上公开仓，仅本地留档）
+docs/3040适配施工方案.md
+docs/通用化改造方案.md
+docs/CustomTkinter迁移方案.md
+docs/gcu-switch-behavior.md
+docs/research-runtime-gpu-migration/
+docs/ask_dialog_dark.png
+docs/gui_verify_t1.png

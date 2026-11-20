@@ -10,12 +10,13 @@ r"""切换问答窗自测（CTk 版）：两个真实 prompt（重启三选/清�
 用法：python tools/ask_selftest.py
 """
 import ctypes
+import os
 import queue
 import sys
 import tkinter as tk
 import types
 
-sys.path.insert(0, r"C:\Users\Yang\.zcode\workspace\default\projects\dgpu_detective")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import customtkinter as ctk
 
 import dgpu_gui
