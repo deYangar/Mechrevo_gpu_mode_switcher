@@ -24,6 +24,10 @@
 
 ![核显省电切换成功](docs/screenshots/eco-done.png)
 
+省电效果给个实感：核显省电挂着，控制台开办公模式，Windows 里开省电模式，屏幕 60Hz，HWiNFO 读到电池放电速度 -15.646 W，预计剩余时间 360.9 分钟。
+
+![核显省电下的整机功耗](docs/screenshots/eco-power.png)
+
 ## 适用机型
 
 查占用不限机型。切换只支持走 GCU 的机械革命机型，即同方模具的 30/40/50 系。蛟龙 30 系部分、WUJIE14XA、星耀、UMI/NUC 是宝龙达 Uniwill 模具，不走 GCU 协议，工具会直接报不支持，不会发命令。
