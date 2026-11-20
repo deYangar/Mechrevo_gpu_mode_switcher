@@ -1104,7 +1104,11 @@ class App:
                 b.configure(state="disabled")
             return
         i = self.gcu_info
-        eco_ok = not (i and i.igpu_only is False)
+        # eco gate：30/50 系按能力位 False 禁用；Gen40 恒可点（2026-11-20
+        # 咩咩拍板）——Gen40 能力判定不可靠（在线无回报 + 注册表位不可信），
+        # 按钮锁死零反馈的误伤（三模真机点不动）比点进编排由词表把关
+        #（双模档明确提示改走运行时省电）更糟；30 系 lite 口径不变
+        eco_ok = not (i and i.igpu_only is False and i.generation != "gen40")
         direct_ok = not (i and i.dgpu_direct is False)
         self.direct_on_btn.configure(state="normal" if direct_ok else "disabled")
         # 混合模式恒可点；走哪条路由 cmd_hybrid 现场判，

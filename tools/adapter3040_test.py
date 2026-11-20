@@ -8,6 +8,9 @@ R5：eco lite 路由——gen30+igpu_only=False 改走 cmd_eco_lite；
 R6：Gen40 能力位误报修正——Support=0 而状态字段活跃回报 → 实证置 True
     （2026-11-20 40 系三模真机：eco 按钮被误禁零反应零日志）；
     无状态字段时 False 维持（双模机 lite 路由依据不变）。
+R7：Gen40 注册表回落 False 降级（路径 B 堵漏）——Gen40 注册表位不可信
+    （E8），读到 0 降级不可得（按钮不禁用/CLI 不路由 lite，词表把关）；
+    非 Gen40 False 维持；pnp_disabled 的 lite 判据纯词表化。
 
 用法：python tools/adapter3040_test.py；全过退出码 0。
 """
@@ -305,6 +308,49 @@ def main() -> int:
     check("R6-3 直连对称→True",
           info.dgpu_direct is True and "状态字段实证" in info.dgpu_source,
           f"dgpu_direct={info.dgpu_direct} 来源={info.dgpu_source}")
+
+    # ---------------- R7：Gen40 注册表回落 False 降级（路径 B 堵漏） ----------------
+    # R7-1 Gen40 离线 + 注册表 0 → igpu_only 降级 None（GUI 按钮不再被禁）；
+    #     判档仍按明确 0 判双模（R4-3 口径不变，词表收窄把关 lite 路由）
+    r = _probe_env("gen40", raw_events=(), reg={"igpumodeonlysupport": 0})
+    try:
+        info = eng.probe_gcu()
+    finally:
+        r()
+    check("R7-1 Gen40注册表0→igpu_only降级None",
+          info.igpu_only is None and "不可信" in info.igpu_source
+          and info.three_mode is False
+          and info.vocab == set(eng.GEN40_DUAL_ACTIONS),
+          f"igpu_only={info.igpu_only} 来源={info.igpu_source}")
+
+    # R7-2 非 Gen40 注册表 False 不降级（30 系 lite 机型 GUI 钮禁用口径保持）
+    r = _probe_env("gen30", raw_events=(), reg={"igpumodeonlysupport": 0})
+    try:
+        info = eng.probe_gcu()
+    finally:
+        r()
+    check("R7-2 30系注册表0→False维持", info.igpu_only is False,
+          f"igpu_only={info.igpu_only}")
+
+    # R7-3 pnp_disabled lite 判据纯词表化：Gen40 未定（TRI 词表 + igpu_only
+    #     降级 None）→ 不误判「已在 lite 态」，走三模残留告警
+    st_pnp40 = eng.DisplayModeState(
+        problems=[("PCI\\VEN_10DE&DEV_28A0&SUBSYS_139A1D05&REV_A1\\4&1", "disabled")],
+        dxgi_names=[])
+    info = _make_info(generation="gen40", vocab=set(eng.GEN40_TRI_ACTIONS),
+                      igpu_only=None, three_mode=None)
+    saved = (eng.read_display_mode_state, eng.enrich_with_gcu_status,
+             eng.probe_gcu, eng.cmd_eco_lite)
+    eng.read_display_mode_state = lambda: st_pnp40
+    eng.probe_gcu = lambda *a, **k: info
+    eng.cmd_eco_lite = lambda on: 0
+    try:
+        out, rc = _capture(eng.cmd_eco_on, None, [])
+    finally:
+        _restore_eco_on(saved)
+    check("R7-3 Gen40未定pnp_disabled→残留告警", rc == 1
+          and "PnP 软禁用残留" in out and "已在 lite" not in out,
+          f"rc={rc}")
 
     print(f"\n{'=' * 40}\n{'全部通过' if all(results) else '存在失败'}："
           f"{sum(results)}/{len(results)}")

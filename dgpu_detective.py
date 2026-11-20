@@ -1469,7 +1469,15 @@ def probe_gcu(listen_secs: float = 4.0) -> GcuInfo:
         igpu_only = parse_flexible_bool(first_field(
             reg, "iGPUModeOnlySupport", "IGpuOnlyModeSupport",
             "IntegratedGpuOnlySupport", "IGpuOnlyConnectionSwitch_Support"))
-        igpu_source = "注册表" if igpu_only is not None else "不可得"
+        if gen == "gen40" and igpu_only is False:
+            # E8：Gen40 注册表位不可靠（官方源码标注不可信），False 不作硬
+            # 结论——降级不可得，按钮不禁用、CLI 不路由 lite，由判档词表+
+            # 实测判据把关（与 three_mode 双空不硬判同口径）。堵 2026-11-20
+            # 40 系三模真机路径：GUI 启动探测离线时被注册表回落 False 误禁。
+            igpu_only = None
+            igpu_source = "不可得（Gen40 注册表位不可信，读到 0 已忽略）"
+        else:
+            igpu_source = "注册表" if igpu_only is not None else "不可得"
 
     # Gen40 三模档判定：在线回报 iGPUModeOnlySupport 优先，回落注册表
     #（TierFromCapability 实录：mqtt 有值用 mqtt，否则 persisted 候选）。
@@ -1983,7 +1991,11 @@ def cmd_eco_on(counters: GpuCounters, adapters_meta: list[Adapter],
         # lite 机型（词表含 GPU_POWERSAVEINGMODE 且无 MUX 省电能力）上这是官方
         # 运行时省电的正常落位（E7：PnP 禁卡是 lite 的副作用），不是假切换残留
         probe = probe_gcu()
-        if "GPU_POWERSAVEINGMODE" in probe.vocab and probe.igpu_only is not True:
+        # lite 判据纯词表化：IGPU_ONLY_CONNECT_RB_ON 不在词表（30 系/40 双模
+        # 档）才判 lite 正常落位——Gen40 注册表回落降级 igpu_only=None 后，
+        # 不能再拿「is not True」误判三模机的软禁用残留为 lite 态
+        if "GPU_POWERSAVEINGMODE" in probe.vocab \
+                and "IGPU_ONLY_CONNECT_RB_ON" not in probe.vocab:
             print("\n已在 lite 省电态（PnP 软禁用，官方运行时省电）。恢复用 --eco lite off。")
             return 0
         print("\n检测到 PnP 软禁用残留（假切换形态）：设备仍焊在总线上。")
